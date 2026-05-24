@@ -34,11 +34,12 @@ public class DummyChannel extends AbstractChannel {
     @Override protected void doDisconnect() { open = false; }
     @Override protected void doClose()      { open = false; }
     @Override protected void doBeginRead()  {}
-    @Override protected void doWrite(ChannelOutboundBuffer buf) { buf.clearNioBuffers(); }
+    @Override protected void doWrite(ChannelOutboundBuffer buf) { /* no-op for dummy channel */ }
     @Override public boolean isOpen()   { return open; }
     @Override public boolean isActive() { return open; }
     @Override public ChannelConfig config() { return config; }
     @Override public EventLoop eventLoop() { return EVENT_LOOP; }
+    @Override public ChannelMetadata metadata() { return new ChannelMetadata(false); }
 
     // -- Simple config --
     private static class DummyChannelConfig extends DefaultChannelConfig {
