@@ -63,6 +63,14 @@ public class BotClient {
         // One proto instance shared for the whole connection
         proto = new MinecraftProtocol(in, out, plugin.getLogger());
 
+        // Auto-detect the server's protocol version before logging in
+        int detectedProto = MinecraftProtocol.queryProtocolVersion(host, port, plugin.getLogger());
+        if (detectedProto > 0) {
+            proto.setProtocolVersion(detectedProto);
+        } else {
+            plugin.getLogger().warning("[" + name + "] Could not detect server protocol, using fallback 769");
+        }
+
         proto.initiateLogin(host, port, name, uuid);
 
         boolean ok = proto.completeLogin(name);
