@@ -1,11 +1,77 @@
-# FakePlayer Configuration
-bot:
-  # Range of bots to spawn on startup
-  min-count: 3
-  max-count: 6
-  # Ticks between each AI action (20 = 1 second)
-  action-interval: 60
-  # Ticks to wait before spawning a replacement after a bot dies (200 = 10s)
-  respawn-delay: 200
-  # World to spawn bots in (leave empty for default world)
-  world: ""
+# RandomBots Configuration
+# Bot count range (random between min and max)
+bot-count-min: 3
+bot-count-max: 10
+
+# Server connection (falls back to SERVER_PORT env variable)
+server-host: "localhost"
+server-port: 25565  # overridden by SERVER_PORT env var if set
+
+# Chat settings
+chat-interval-min: 15   # seconds between bot messages (min)
+chat-interval-max: 45   # seconds between bot messages (max)
+
+# Action settings
+action-interval-min: 5   # seconds between actions (min)
+action-interval-max: 15  # seconds between actions (max)
+
+# Respawn delay (seconds after bot death)
+respawn-delay: 5
+
+# Bot name prefixes/suffixes for generation
+name-prefixes:
+  - "Dark"
+  - "Shadow"
+  - "Iron"
+  - "Storm"
+  - "Frost"
+  - "Blaze"
+  - "Thunder"
+  - "Void"
+  - "Neon"
+  - "Pixel"
+  - "Cyber"
+  - "Wild"
+  - "Swift"
+  - "Brave"
+  - "Lone"
+
+name-suffixes:
+  - "Walker"
+  - "Blade"
+  - "Hunter"
+  - "Seeker"
+  - "Rider"
+  - "Forge"
+  - "Strike"
+  - "Hawk"
+  - "Wolf"
+  - "Axe"
+  - "Fist"
+  - "Eye"
+  - "Claw"
+  - "Shield"
+  - "Arrow"
+
+# Chat messages bots will say
+chat-messages:
+  - "大家好啊！"
+  - "服务器真好玩！"
+  - "有人要一起玩吗？"
+  - "我来了！"
+  - "这里真漂亮~"
+  - "谁有好东西分享？"
+  - "今天天气真不错"
+  - "我要去探险了！"
+  - "哇，这是什么地方！"
+  - "一起来建房子吧！"
+  - "感觉这里很危险..."
+  - "找到宝藏了！"
+  - "小心怪物！"
+  - "哈哈哈好有趣"
+  - "有没有人在？"
+  - "我迷路了lol"
+  - "谁能帮帮我？"
+  - "太厉害了！"
+  - "我要变强！"
+  - "努力挖矿中..."

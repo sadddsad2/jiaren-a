@@ -1,18 +1,19 @@
-name: FakePlayer
-version: '1.0.0'
-main: com.example.fakeplayer.FakePlayerPlugin
-api-version: '1.20'
-description: Lightweight fake player bots for Paper 1.20+ (NMS injection, online-mode compatible)
-authors: [ Example ]
+name: RandomBots
+version: ${project.version}
+main: com.randomnpcs.RandomBotsPlugin
+api-version: '1.21'
+description: Spawns random NPC bots that chat, move, and respawn on death
+author: RandomBots
+website: https://github.com/randomnpcs
 
 commands:
-  fakeplayer:
-    description: Manage fake player bots
-    usage: /fakeplayer <spawn|remove <name>|removeall|list>
-    aliases: [ fp ]
-    permission: fakeplayer.admin
+  randombots:
+    description: Main command for RandomBots plugin
+    usage: /randombots <start|stop|status|reload>
+    aliases: [rbots, rb]
+    permission: randombots.admin
 
 permissions:
-  fakeplayer.admin:
-    description: Manage fake players
+  randombots.admin:
+    description: Allows full control of RandomBots
     default: op
