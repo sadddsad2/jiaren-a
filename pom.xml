@@ -10,7 +10,7 @@
     <packaging>jar</packaging>
 
     <name>FakePlayer</name>
-    <description>Fake player bots for Paper 1.20+ servers, NMS-injected via reflection</description>
+    <description>Fake player bots for Paper 1.21+ servers, NMS-injected via reflection</description>
 
     <properties>
         <maven.compiler.source>17</maven.compiler.source>
@@ -23,7 +23,6 @@
             <id>papermc</id>
             <url>https://repo.papermc.io/repository/maven-public/</url>
         </repository>
-        <!-- Mojang Authlib is hosted on minecraft-libraries -->
         <repository>
             <id>minecraft-libraries</id>
             <url>https://libraries.minecraft.net/</url>
@@ -31,18 +30,20 @@
     </repositories>
 
     <dependencies>
-        <!-- Paper API – provided by the server jar at runtime -->
+        <!--
+            Paper API – provided by the server jar at runtime.
+            We use paper-api for the Bukkit surface (org.bukkit.*).
+        -->
         <dependency>
             <groupId>io.papermc.paper</groupId>
             <artifactId>paper-api</artifactId>
-            <version>1.20.4-R0.1-SNAPSHOT</version>
+            <version>1.21.1-R0.1-SNAPSHOT</version>
             <scope>provided</scope>
         </dependency>
 
         <!--
-            Netty – lives inside the Paper server jar at runtime, but the compiler
-            needs it on the classpath during CI where there is no server jar.
-            Scope=provided so it is NOT included in our shaded jar.
+            Netty – lives inside the Paper server jar at runtime.
+            Needed at compile-time for DummyChannel (extends AbstractChannel).
         -->
         <dependency>
             <groupId>io.netty</groupId>
@@ -52,14 +53,27 @@
         </dependency>
 
         <!--
-            Mojang Authlib – also bundled in the Paper server jar at runtime.
+            Mojang Authlib – bundled in the Paper server jar at runtime.
             Needed at compile-time for GameProfile in VersionAdapter.
-            Scope=provided so it is NOT included in our shaded jar.
         -->
         <dependency>
             <groupId>com.mojang</groupId>
             <artifactId>authlib</artifactId>
-            <version>4.0.43</version>
+            <version>6.0.54</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!--
+            Paper dev bundle (Mojang-mapped NMS classes).
+            Needed at compile-time ONLY for FakeConnection extends Connection.
+            NOT shaded into the output jar (scope=provided).
+            Paper publishes this as "dev" classifier on their Maven repo.
+        -->
+        <dependency>
+            <groupId>io.papermc.paper</groupId>
+            <artifactId>paper</artifactId>
+            <version>1.21.1-R0.1-SNAPSHOT</version>
+            <classifier>mojang-mapped</classifier>
             <scope>provided</scope>
         </dependency>
     </dependencies>
