@@ -33,6 +33,7 @@ public class MinecraftProtocol {
     private static final int S_CONFIG_ACK           = 0x03; // Configuration → Play (Acknowledge Finish Configuration)
     private static final int S_CLIENT_INFO          = 0x00; // Configuration state: Client Information
     private static final int S_KEEPALIVE_CONFIG     = 0x04; // Configuration state keepalive
+    private static final int S_CONFIG_PLUGIN_MSG     = 0x02; // Configuration state: Serverbound Plugin Message
     private static final int S_CHAT_MESSAGE         = 0x06; // Play state
     private static final int S_CLIENT_SETTINGS      = 0x0F; // Play state (legacy, keep for safety)
     private static final int S_KEEPALIVE_PLAY       = 0x1A; // Play state
@@ -283,7 +284,22 @@ public class MinecraftProtocol {
                     return false;
                 }
 
-                // Plugin messages and registry data — silently ignored
+                case C_CONFIG_PLUGIN_MSG -> {
+                    // Server sends minecraft:brand during configuration; we must respond in kind.
+                    DataInputStream d = pkt.stream();
+                    String channel = readString(d);
+                    if ("minecraft:brand".equals(channel)) {
+                        // Reply with our own brand plugin message
+                        ByteArrayOutputStream resp = new ByteArrayOutputStream();
+                        writeString(resp, "minecraft:brand");
+                        writeString(resp, "vanilla"); // brand name
+                        sendRaw(S_CONFIG_PLUGIN_MSG, resp.toByteArray());
+                        log.fine("[" + botName + "] Replied to minecraft:brand");
+                    }
+                    // All other plugin messages silently ignored
+                }
+
+                // Registry data and other clientbound config packets — silently ignored
             }
         }
         log.warning("[" + botName + "] Configuration phase timed out");
