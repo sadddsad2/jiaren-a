@@ -290,17 +290,22 @@ public class MinecraftProtocol {
         return false;
     }
 
-    /** Send Client Information (used during Configuration state). */
+    /** Send Client Information (used during Configuration state).
+     *  Field layout matches 1.21.5+ (protocol 764+):
+     *    locale, viewDist, chatMode, chatColors, skinParts, mainHand,
+     *    textFiltering, serverListings, particleStatus (NEW in 1.21.5)
+     */
     private void sendClientInformation() throws IOException {
         ByteArrayOutputStream buf = new ByteArrayOutputStream();
         writeString(buf, "zh_cn"); // locale
         buf.write(10);             // view distance
         writeVarInt(buf, 0);       // chat mode: enabled
         buf.write(1);              // chat colors
-        buf.write(0b01111111);     // skin parts
+        buf.write(0b01111111);     // skin parts (all enabled)
         writeVarInt(buf, 1);       // main hand: right
-        buf.write(0);              // text filtering
+        buf.write(0);              // text filtering: disabled
         buf.write(1);              // allow server listings
+        writeVarInt(buf, 2);       // particle status: all (added in 1.21.5 / protocol 766+)
         sendRaw(S_CLIENT_INFO, buf.toByteArray());
     }
 
