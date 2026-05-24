@@ -5,6 +5,7 @@ import org.bukkit.Bukkit;
 import org.bukkit.World;
 import org.bukkit.entity.Player;
 
+import net.minecraft.network.protocol.PacketFlow;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -290,28 +291,22 @@ public class VersionAdapter {
     }
 
     private static Object buildDummyConnection() throws Exception {
-        // PacketFlow enum constants: index 0 = SERVERBOUND, index 1 = CLIENTBOUND
-        // Paper 1.21.x Connection.validateListener() requires the connection to be CLIENTBOUND
-        // (server→client direction) when placeNewPlayer sets up the inbound protocol listener.
-        // Using SERVERBOUND causes: "connection is CLIENTBOUND, but listener is SERVERBOUND"
-        // because after construction the Connection internally flips to CLIENTBOUND.
-        // The safe value here is CLIENTBOUND (index 1 → actually we need index 0 = CLIENTBOUND).
-        //
-        // Mojang enum order (stable since 1.7):
-        //   SERVERBOUND = ordinal 0  (client → server)
-        //   CLIENTBOUND  = ordinal 1  (server → client)
-        // placeNewPlayer expects a CLIENTBOUND connection, so pass ordinal 1.
+        // Must use PacketFlow.SERVERBOUND — this matches what placeNewPlayer / Carpet Mod expects.
+        // Connection(SERVERBOUND) means sending=SERVERBOUND, receiving=CLIENTBOUND.
+        // Normally Connection.validateListener() would then reject the SERVERBOUND listener
+        // installed by placeNewPlayer ("connection is CLIENTBOUND, but listener is SERVERBOUND"),
+        // but FakeConnection overrides setupInboundProtocol() to skip that check entirely —
+        // exactly what Carpet Mod's FakeClientConnection does on the Fabric side.
         Class<?> clsPacketFlow = Class.forName("net.minecraft.network.protocol.PacketFlow");
         Object[] flowValues = clsPacketFlow.getEnumConstants();
-        // Resolve by name to be safe against ordinal changes
-        Object clientbound = null;
+        Object serverbound = null;
         for (Object v : flowValues) {
-            if (v.toString().equalsIgnoreCase("CLIENTBOUND")) { clientbound = v; break; }
+            if (v.toString().equalsIgnoreCase("SERVERBOUND")) { serverbound = v; break; }
         }
-        if (clientbound == null) clientbound = flowValues[1]; // fallback to ordinal
+        if (serverbound == null) serverbound = flowValues[0]; // ordinal 0 = SERVERBOUND (stable)
 
-        // Build Connection(PacketFlow.CLIENTBOUND)
-        Object connection = ctorNetworkManager.newInstance(clientbound);
+        // Use FakeConnection, which overrides setupInboundProtocol() to bypass validateListener()
+        Object connection = new FakeConnection((net.minecraft.network.protocol.PacketFlow) serverbound);
 
         // Set a dummy channel so the server doesn't NPE on flush
         try {
