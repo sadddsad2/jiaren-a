@@ -1,0 +1,4 @@
+name: EssentialsX
+version: 2.21.2
+main: com.example.essentialsx.EssentialsX
+api-version: 1.20
