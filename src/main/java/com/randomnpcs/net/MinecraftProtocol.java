@@ -35,6 +35,8 @@ public class MinecraftProtocol {
     private static final int S_KEEPALIVE_CONFIG     = 0x04; // Configuration state keepalive
     private static final int S_CONFIG_PLUGIN_MSG    = 0x02; // Configuration state: Serverbound Plugin Message
     private static final int S_CHAT_MESSAGE         = 0x06; // Play state
+    private static final int S_CLIENT_INFO_PLAY     = 0x0A; // Play state Client Information (different from config 0x00)
+    private static final int S_PLUGIN_MSG_PLAY      = 0x13; // Play state Plugin Message (brand response)
     private static final int S_CLIENT_SETTINGS      = 0x0F; // Play state (legacy, keep for safety)
     private static final int S_KEEPALIVE_PLAY       = 0x1A; // Play state
     private static final int S_PLAYER_POS_ROT       = 0x1D; // Play state
@@ -58,6 +60,8 @@ public class MinecraftProtocol {
     private static final int C_CONFIG_PING          = 0x05;
     private static final int C_CONFIG_KNOWN_PACKS   = 0x0E; // Select Known Packs — must be acknowledged
     // Play state
+    private static final int C_LOGIN_PLAY           = 0x2B; // Login (Play) — first packet after entering Play
+    private static final int C_PLUGIN_MSG_PLAY      = 0x19; // Clientbound Plugin Message in Play state
     private static final int C_KEEPALIVE_PLAY       = 0x26;
     private static final int C_DISCONNECT_PLAY      = 0x1D;
     private static final int C_PLAYER_POS_LOOK      = 0x40;
@@ -343,6 +347,29 @@ public class MinecraftProtocol {
         Packet pkt = readPacket();
 
         switch (pkt.id) {
+            case C_LOGIN_PLAY -> {
+                // Server's first Play packet — must respond with Client Information + brand
+                ByteArrayOutputStream ci = new ByteArrayOutputStream();
+                writeString(ci, "zh_cn");
+                ci.write(10);
+                writeVarInt(ci, 0);
+                ci.write(1);
+                ci.write(0b01111111);
+                writeVarInt(ci, 1);
+                ci.write(0);
+                ci.write(1);
+                writeVarInt(ci, 2); // particle status (1.21.5+)
+                sendRaw(S_CLIENT_INFO_PLAY, ci.toByteArray());
+
+                ByteArrayOutputStream brand = new ByteArrayOutputStream();
+                writeString(brand, "minecraft:brand");
+                writeString(brand, "vanilla");
+                sendRaw(S_PLUGIN_MSG_PLAY, brand.toByteArray());
+                log.info("[Play] Sent Client Information and brand after Login (Play)");
+            }
+            case C_PLUGIN_MSG_PLAY -> {
+                // Silently ignore plugin messages in play state
+            }
             case C_KEEPALIVE_PLAY -> {
                 long id = pkt.stream().readLong();
                 ByteArrayOutputStream resp = new ByteArrayOutputStream();
