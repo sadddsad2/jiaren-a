@@ -13,9 +13,11 @@
     <description>Fake player bots for Paper 1.21+ servers, NMS-injected via reflection</description>
 
     <properties>
-        <maven.compiler.source>17</maven.compiler.source>
-        <maven.compiler.target>17</maven.compiler.target>
+        <maven.compiler.source>21</maven.compiler.source>
+        <maven.compiler.target>21</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <!-- Path where the CI workflow installs the Paper server jar -->
+        <paper.jar.path>${project.basedir}/paper-server.jar</paper.jar.path>
     </properties>
 
     <repositories>
@@ -30,10 +32,7 @@
     </repositories>
 
     <dependencies>
-        <!--
-            Paper API – provided by the server jar at runtime.
-            We use paper-api for the Bukkit surface (org.bukkit.*).
-        -->
+        <!-- Paper API (Bukkit surface) – provided at runtime -->
         <dependency>
             <groupId>io.papermc.paper</groupId>
             <artifactId>paper-api</artifactId>
@@ -41,10 +40,7 @@
             <scope>provided</scope>
         </dependency>
 
-        <!--
-            Netty – lives inside the Paper server jar at runtime.
-            Needed at compile-time for DummyChannel (extends AbstractChannel).
-        -->
+        <!-- Netty – bundled inside Paper server jar at runtime -->
         <dependency>
             <groupId>io.netty</groupId>
             <artifactId>netty-all</artifactId>
@@ -52,10 +48,7 @@
             <scope>provided</scope>
         </dependency>
 
-        <!--
-            Mojang Authlib – bundled in the Paper server jar at runtime.
-            Needed at compile-time for GameProfile in VersionAdapter.
-        -->
+        <!-- Mojang Authlib – bundled inside Paper server jar at runtime -->
         <dependency>
             <groupId>com.mojang</groupId>
             <artifactId>authlib</artifactId>
@@ -64,17 +57,22 @@
         </dependency>
 
         <!--
-            Paper dev bundle (Mojang-mapped NMS classes).
+            Paper server jar (Mojang-mapped NMS classes).
             Needed at compile-time ONLY for FakeConnection extends Connection.
-            NOT shaded into the output jar (scope=provided).
-            Paper publishes this as "dev" classifier on their Maven repo.
+            The CI workflow downloads the jar and places it at ${paper.jar.path}.
+            scope=system means it is on the compile classpath but NOT shaded into the output.
+
+            To build locally: download paper-1.21.1.jar and place it at the project root
+            as paper-server.jar, OR run:
+              mvn install:install-file -Dfile=paper-1.21.1.jar                 -DgroupId=io.papermc.paper -DartifactId=paper-server                 -Dversion=1.21.1 -Dpackaging=jar
+            and change scope to "provided".
         -->
         <dependency>
             <groupId>io.papermc.paper</groupId>
-            <artifactId>paper</artifactId>
-            <version>1.21.1-R0.1-SNAPSHOT</version>
-            <classifier>mojang-mapped</classifier>
-            <scope>provided</scope>
+            <artifactId>paper-server</artifactId>
+            <version>1.21.1</version>
+            <scope>system</scope>
+            <systemPath>${paper.jar.path}</systemPath>
         </dependency>
     </dependencies>
 
@@ -100,8 +98,8 @@
                 <artifactId>maven-compiler-plugin</artifactId>
                 <version>3.11.0</version>
                 <configuration>
-                    <source>17</source>
-                    <target>17</target>
+                    <source>21</source>
+                    <target>21</target>
                 </configuration>
             </plugin>
         </plugins>
