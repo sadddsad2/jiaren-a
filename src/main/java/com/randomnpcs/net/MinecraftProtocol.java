@@ -8,7 +8,10 @@ import java.util.UUID;
 import java.util.logging.Logger;
 
 /**
- * Minimal Minecraft Java Edition protocol (1.21.x / protocol 769).
+ * Minimal Minecraft Java Edition protocol with auto-detected protocol version.
+ *
+ * Before logging in, call queryProtocolVersion(host, port) to ping the server
+ * and retrieve its protocol number automatically — no hardcoded version needed.
  *
  * One instance is created per BotClient and shared for the lifetime of the
  * connection so that compression state is preserved across all calls.
@@ -56,11 +59,14 @@ public class MinecraftProtocol {
     private static final int C_DISCONNECT_PLAY      = 0x1D;
     private static final int C_PLAYER_POS_LOOK      = 0x40;
 
-    private static final int PROTOCOL_VERSION = 769; // MC 1.21.4
+    private static final int PROTOCOL_VERSION_FALLBACK = 769; // MC 1.21.4 fallback
 
     private final DataInputStream  in;
     private final DataOutputStream out;
     private final Logger log;
+
+    // Resolved at connect time via status ping; falls back to 769 if ping fails
+    private int protocolVersion = PROTOCOL_VERSION_FALLBACK;
 
     // Compression state — must survive the lifetime of the connection
     private boolean compressionEnabled    = false;
@@ -72,6 +78,75 @@ public class MinecraftProtocol {
         this.log = log;
     }
 
+    /**
+     * Ping the server's Status endpoint, parse the JSON response and return
+     * the server's protocol version number. Opens and closes its own socket
+     * so it does not interfere with the login connection.
+     *
+     * @return protocol version reported by the server, or -1 on failure
+     */
+    public static int queryProtocolVersion(String host, int port, Logger log) {
+        try (java.net.Socket s = new java.net.Socket(host, port)) {
+            s.setSoTimeout(5_000);
+            DataOutputStream out = new DataOutputStream(
+                    new BufferedOutputStream(s.getOutputStream()));
+            DataInputStream  in  = new DataInputStream(
+                    new BufferedInputStream(s.getInputStream()));
+
+            // Handshake — next state = 1 (Status)
+            ByteArrayOutputStream buf = new ByteArrayOutputStream();
+            writeVarInt(buf, PROTOCOL_VERSION_FALLBACK); // version doesn't matter for status ping
+            writeString(buf, host);
+            writeShort(buf, port);
+            writeVarInt(buf, 1); // next state = Status
+            ByteArrayOutputStream idBuf = new ByteArrayOutputStream();
+            writeVarInt(idBuf, 0x00);
+            idBuf.write(buf.toByteArray());
+            byte[] data = idBuf.toByteArray();
+            ByteArrayOutputStream frame = new ByteArrayOutputStream();
+            writeVarInt(frame, data.length);
+            frame.write(data);
+            out.write(frame.toByteArray());
+
+            // Status Request (0x00, empty payload)
+            ByteArrayOutputStream req = new ByteArrayOutputStream();
+            writeVarInt(req, 1); // length = 1 (just the packet id varint)
+            writeVarInt(req, 0x00);
+            out.write(req.toByteArray());
+            out.flush();
+
+            // Read Status Response
+            int pktLen = readVarInt(in);
+            byte[] raw = in.readNBytes(pktLen);
+            DataInputStream d = new DataInputStream(new ByteArrayInputStream(raw));
+            int pktId = readVarInt(d);
+            if (pktId != 0x00) {
+                log.warning("[StatusPing] Unexpected packet id: 0x" + Integer.toHexString(pktId));
+                return -1;
+            }
+            String json = readString(d);
+
+            // Parse "protocol":<number> without a JSON library
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("\"protocol\"\\s*:\\s*(-?\\d+)")
+                    .matcher(json);
+            if (m.find()) {
+                int proto = Integer.parseInt(m.group(1));
+                log.info("[StatusPing] Server protocol version: " + proto);
+                return proto;
+            }
+            log.warning("[StatusPing] Could not find protocol version in response");
+        } catch (Exception e) {
+            log.warning("[StatusPing] Failed to query server protocol: " + e.getMessage());
+        }
+        return -1;
+    }
+
+    /** Set the protocol version to use for handshake packets. */
+    public void setProtocolVersion(int version) {
+        this.protocolVersion = version;
+    }
+
     // ═══════════════════════════════════════════════════════════════════
     // Public API called by BotClient
     // ═══════════════════════════════════════════════════════════════════
@@ -80,7 +155,7 @@ public class MinecraftProtocol {
     public void initiateLogin(String host, int port, String name, UUID uuid) throws IOException {
         // Handshake
         ByteArrayOutputStream buf = new ByteArrayOutputStream();
-        writeVarInt(buf, PROTOCOL_VERSION);
+        writeVarInt(buf, protocolVersion);
         writeString(buf, host);
         writeShort(buf, port);
         writeVarInt(buf, 2); // next state = Login
