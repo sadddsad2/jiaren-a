@@ -171,17 +171,24 @@ public class VersionAdapter {
     }
 
     private static Constructor<?> resolveServerPlayerConstructor() throws Exception {
-        // Try every constructor; pick the one whose params include GameProfile
+        // Try every constructor; pick the one whose params include GameProfile.
+        // If multiple constructors match (Paper 1.21.x has several), prefer the one
+        // with the most parameters – it is the most complete and always the right one.
+        Constructor<?> best = null;
         for (Constructor<?> c : clsServerPlayer.getDeclaredConstructors()) {
             Class<?>[] params = c.getParameterTypes();
             for (Class<?> p : params) {
                 if (p.equals(GameProfile.class)) {
-                    c.setAccessible(true);
-                    return c;
+                    if (best == null || c.getParameterCount() > best.getParameterCount()) {
+                        best = c;
+                    }
+                    break;
                 }
             }
         }
-        throw new NoSuchMethodException("No ServerPlayer constructor with GameProfile found");
+        if (best == null) throw new NoSuchMethodException("No ServerPlayer constructor with GameProfile found");
+        best.setAccessible(true);
+        return best;
     }
 
     private static Method resolveNewPlayerMethod() throws Exception {
@@ -316,13 +323,14 @@ public class VersionAdapter {
         Class<?>[] params = ctorServerPlayer.getParameterTypes();
         Object[] args = new Object[params.length];
         for (int i = 0; i < params.length; i++) {
-            if (params[i].equals(clsMinecraftServer) || clsMinecraftServer.isAssignableFrom(params[i])) {
+            // params[i].isAssignableFrom(X) means "can X be passed where params[i] is expected"
+            if (params[i].isAssignableFrom(clsMinecraftServer)) {
                 args[i] = nmsServer;
-            } else if (params[i].equals(clsServerLevel) || clsServerLevel.isAssignableFrom(params[i])) {
+            } else if (params[i].isAssignableFrom(clsServerLevel)) {
                 args[i] = serverLevel;
             } else if (params[i].equals(GameProfile.class)) {
                 args[i] = profile;
-            } else if (params[i].equals(clsClientInformation)) {
+            } else if (clsClientInformation != null && params[i].equals(clsClientInformation)) {
                 // ClientInformation.createDefault() in 1.20.5+
                 Method createDefault = clsClientInformation.getMethod("createDefault");
                 args[i] = createDefault.invoke(null);
@@ -330,6 +338,16 @@ public class VersionAdapter {
                 args[i] = null; // other params default to null
             }
         }
+
+        // Safety check: MinecraftServer must never be null – a null here causes the exact
+        // "server is null" NullPointerException seen in ServerPlayer.<init>
+        for (int i = 0; i < params.length; i++) {
+            if (params[i].isAssignableFrom(clsMinecraftServer) && args[i] == null) {
+                throw new IllegalStateException(
+                    "Could not map MinecraftServer to ServerPlayer constructor param [" + i + "]: " + params[i].getName());
+            }
+        }
+
         return ctorServerPlayer.newInstance(args);
     }
 
