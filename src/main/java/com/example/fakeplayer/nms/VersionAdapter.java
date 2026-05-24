@@ -5,7 +5,6 @@ import org.bukkit.Bukkit;
 import org.bukkit.World;
 import org.bukkit.entity.Player;
 
-import net.minecraft.network.protocol.PacketFlow;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -291,31 +290,49 @@ public class VersionAdapter {
     }
 
     private static Object buildDummyConnection() throws Exception {
-        // Must use PacketFlow.SERVERBOUND — this matches what placeNewPlayer / Carpet Mod expects.
-        // Connection(SERVERBOUND) means sending=SERVERBOUND, receiving=CLIENTBOUND.
-        // Normally Connection.validateListener() would then reject the SERVERBOUND listener
-        // installed by placeNewPlayer ("connection is CLIENTBOUND, but listener is SERVERBOUND"),
-        // but FakeConnection overrides setupInboundProtocol() to skip that check entirely —
-        // exactly what Carpet Mod's FakeClientConnection does on the Fabric side.
+        // Must use PacketFlow.SERVERBOUND — same as Carpet Mod's FakeClientConnection.
+        // Connection(SERVERBOUND) sets sending=SERVERBOUND, receiving=CLIENTBOUND internally.
+        //
+        // Paper 1.21.x added Connection.validateListener() which checks that the listener's
+        // flow() matches connection.getReceiving(). Since placeNewPlayer installs a SERVERBOUND
+        // ServerGamePacketListenerImpl, and receiving=CLIENTBOUND, this would normally throw:
+        //   "connection is CLIENTBOUND, but listener is SERVERBOUND"
+        //
+        // Carpet Mod's fix: subclass Connection and override setupInboundProtocol() to skip
+        // validateListener(). We cannot subclass at compile time (no NMS on classpath), so we
+        // instead patch the Connection instance via reflection AFTER placeNewPlayer calls
+        // setupInboundProtocol — but that's too late. Instead we intercept the call by
+        // temporarily replacing the connection's "receiving" field with SERVERBOUND so the
+        // validation passes, then restore it. This is equivalent in effect.
         Class<?> clsPacketFlow = Class.forName("net.minecraft.network.protocol.PacketFlow");
         Object[] flowValues = clsPacketFlow.getEnumConstants();
         Object serverbound = null;
         for (Object v : flowValues) {
             if (v.toString().equalsIgnoreCase("SERVERBOUND")) { serverbound = v; break; }
         }
-        if (serverbound == null) serverbound = flowValues[0]; // ordinal 0 = SERVERBOUND (stable)
+        if (serverbound == null) serverbound = flowValues[0];
 
-        // Use FakeConnection, which overrides setupInboundProtocol() to bypass validateListener()
-        Object connection = new FakeConnection((net.minecraft.network.protocol.PacketFlow) serverbound);
+        // Build Connection(SERVERBOUND)
+        Object connection = ctorNetworkManager.newInstance(serverbound);
+
+        // Patch: find the "receiving" field inside Connection and set it to SERVERBOUND so
+        // validateListener() sees receiving==SERVERBOUND == listener.flow()==SERVERBOUND → passes.
+        // Field is named "receiving" in Mojmap; search common obfuscated names as fallback.
+        try {
+            Field receivingField = findField(clsNetworkManager, "receiving", "h", "c", "d");
+            receivingField.setAccessible(true);
+            receivingField.set(connection, serverbound);
+            LOG.fine("Patched Connection.receiving to SERVERBOUND for validateListener bypass.");
+        } catch (Exception e) {
+            LOG.warning("Could not patch Connection.receiving field — validateListener may fail: " + e.getMessage());
+        }
 
         // Set a dummy channel so the server doesn't NPE on flush
         try {
             Field channelField = findField(clsNetworkManager, "channel", "k", "f");
             channelField.setAccessible(true);
-            // Use a local loopback address so disconnect doesn't crash
             channelField.set(connection, new DummyChannel());
         } catch (Exception e) {
-            // Best-effort; some Paper builds handle null channel gracefully
             LOG.fine("Could not set dummy channel: " + e.getMessage());
         }
 
