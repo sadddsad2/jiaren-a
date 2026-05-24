@@ -56,6 +56,7 @@ public class MinecraftProtocol {
     private static final int C_CONFIG_FINISH        = 0x03; // was 0x02 pre-1.21.5
     private static final int C_CONFIG_KEEPALIVE     = 0x04; // was 0x03 pre-1.21.5
     private static final int C_CONFIG_PING          = 0x05;
+    private static final int C_CONFIG_KNOWN_PACKS   = 0x0E; // Select Known Packs — must be acknowledged
     // Play state
     private static final int C_KEEPALIVE_PLAY       = 0x26;
     private static final int C_DISCONNECT_PLAY      = 0x1D;
@@ -248,7 +249,7 @@ public class MinecraftProtocol {
 
         for (int i = 0; i < 200; i++) {
             Packet pkt = readPacket();
-            log.fine("[" + botName + "] Config packet 0x" + Integer.toHexString(pkt.id)
+            log.info("[" + botName + "] Config packet 0x" + Integer.toHexString(pkt.id)
                     + " (" + pkt.data.length + " bytes)");
 
             switch (pkt.id) {
@@ -256,7 +257,7 @@ public class MinecraftProtocol {
                 case C_CONFIG_FINISH -> {
                     // Acknowledge Finish Configuration → enter Play state
                     sendRaw(S_CONFIG_ACK, new byte[0]);
-                    log.fine("[" + botName + "] Configuration complete, entering Play state");
+                    log.info("[" + botName + "] Configuration complete, entering Play state");
                     return true;
                 }
 
@@ -285,6 +286,14 @@ public class MinecraftProtocol {
                     return false;
                 }
 
+                case C_CONFIG_KNOWN_PACKS -> {
+                    // Server requires client to reply with its known resource packs (can be empty list)
+                    ByteArrayOutputStream resp = new ByteArrayOutputStream();
+                    writeVarInt(resp, 0); // known pack count = 0
+                    sendRaw(0x07, resp.toByteArray()); // Serverbound Select Known Packs
+                    log.info("[" + botName + "] Replied to Select Known Packs");
+                }
+
                 case C_CONFIG_PLUGIN_MSG -> {
                     // Server sends minecraft:brand during configuration; we must respond in kind.
                     DataInputStream d = pkt.stream();
@@ -295,7 +304,7 @@ public class MinecraftProtocol {
                         writeString(resp, "minecraft:brand");
                         writeString(resp, "vanilla"); // brand name
                         sendRaw(S_CONFIG_PLUGIN_MSG, resp.toByteArray());
-                        log.fine("[" + botName + "] Replied to minecraft:brand");
+                        log.info("[" + botName + "] Replied to minecraft:brand");
                     }
                     // All other plugin messages silently ignored
                 }
