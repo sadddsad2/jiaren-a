@@ -1,18 +1,14 @@
 name: Build and Release
-
 on:
   push:
     tags:
       - 'v*'
   workflow_dispatch:
-
 permissions:
   contents: write
-
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -23,18 +19,6 @@ jobs:
           java-version: '21'
           distribution: 'temurin'
           cache: maven
-
-      - name: Download Paper 1.21.1 server jar (NMS compile-time dependency)
-        run: |
-          # Fetch the latest build number for 1.21.1 dynamically
-          BUILD=$(curl -fsSL "https://api.papermc.io/v2/projects/paper/versions/1.21.1/builds" \
-            | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['builds'][-1]['build'])")
-          JAR="paper-1.21.1-${BUILD}.jar"
-          echo "Downloading Paper build ${BUILD} (${JAR})..."
-          curl -fsSL \
-            "https://api.papermc.io/v2/projects/paper/versions/1.21.1/builds/${BUILD}/downloads/${JAR}" \
-            -o paper-server.jar
-          echo "Downloaded: $(du -sh paper-server.jar | cut -f1)"
 
       - name: Build with Maven
         run: mvn package -B --no-transfer-progress
@@ -55,24 +39,20 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.get_version.outputs.release_name }}
-          name: "FakePlayer ${{ steps.get_version.outputs.release_name }}"
+          name: "RandomBots ${{ steps.get_version.outputs.release_name }}"
           body: |
-            ## FakePlayer ${{ steps.get_version.outputs.release_name }}
-
+            ## RandomBots ${{ steps.get_version.outputs.release_name }}
             ### 安装方法
-            1. 下载 `FakePlayer-${{ steps.get_version.outputs.version }}.jar`
+            1. 下载 `RandomBots-${{ steps.get_version.outputs.version }}.jar`
             2. 放入服务器 `plugins/` 目录
-            3. 重启服务器
-
+            3. 重启服务器（插件会自动读取 `SERVER_PORT` 环境变量）
             ### 要求
-            - Paper 1.21.1+
-            - Java 21+
-
+            - Paper 1.21.4+
+            - Java 17+
             ### 更新日志
             ${{ github.event.head_commit.message }}
-
             ---
             构建提交：${{ github.sha }}
-          files: target/FakePlayer-*.jar
+          files: target/RandomBots-*.jar
           draft: false
           prerelease: false
