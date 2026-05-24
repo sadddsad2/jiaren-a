@@ -33,7 +33,7 @@ public class MinecraftProtocol {
     private static final int S_CONFIG_ACK           = 0x03; // Configuration → Play (Acknowledge Finish Configuration)
     private static final int S_CLIENT_INFO          = 0x00; // Configuration state: Client Information
     private static final int S_KEEPALIVE_CONFIG     = 0x04; // Configuration state keepalive
-    private static final int S_CONFIG_PLUGIN_MSG     = 0x02; // Configuration state: Serverbound Plugin Message
+    private static final int S_CONFIG_PLUGIN_MSG    = 0x02; // Configuration state: Serverbound Plugin Message
     private static final int S_CHAT_MESSAGE         = 0x06; // Play state
     private static final int S_CLIENT_SETTINGS      = 0x0F; // Play state (legacy, keep for safety)
     private static final int S_KEEPALIVE_PLAY       = 0x1A; // Play state
@@ -49,11 +49,12 @@ public class MinecraftProtocol {
     private static final int C_LOGIN_SUCCESS        = 0x02;
     private static final int C_SET_COMPRESSION      = 0x03;
     private static final int C_LOGIN_PLUGIN_REQUEST = 0x04;
-    // Configuration state (1.20.2+)
-    private static final int C_CONFIG_PLUGIN_MSG    = 0x00;
-    private static final int C_CONFIG_DISCONNECT    = 0x01;
-    private static final int C_CONFIG_FINISH        = 0x02;
-    private static final int C_CONFIG_KEEPALIVE     = 0x03;
+    // Configuration state (1.21.5+ / protocol 766+)
+    private static final int C_CONFIG_COOKIE_REQ    = 0x00;
+    private static final int C_CONFIG_PLUGIN_MSG    = 0x01; // was 0x00 pre-1.21.5
+    private static final int C_CONFIG_DISCONNECT    = 0x02; // was 0x01 pre-1.21.5
+    private static final int C_CONFIG_FINISH        = 0x03; // was 0x02 pre-1.21.5
+    private static final int C_CONFIG_KEEPALIVE     = 0x04; // was 0x03 pre-1.21.5
     private static final int C_CONFIG_PING          = 0x05;
     // Play state
     private static final int C_KEEPALIVE_PLAY       = 0x26;
