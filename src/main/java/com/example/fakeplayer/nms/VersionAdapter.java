@@ -352,20 +352,37 @@ public class VersionAdapter {
     }
 
     private static Object buildCookie(GameProfile profile) throws Exception {
-        // CommonListenerCookie(GameProfile, int latency, ClientInformation info)
-        // or CommonListenerCookie(GameProfile, ClientInformation)
+        // CommonListenerCookie constructor signature changed across versions:
+        //   1.20.5-1.20.6: CommonListenerCookie(GameProfile, int latency, ClientInformation)
+        //   1.21+:          CommonListenerCookie(GameProfile, int latency, ClientInformation, boolean transferred)
+        //
+        // The 'transferred' boolean (Paper 1.21+) indicates a cross-server transfer; always false for bots.
+        // Passing null for any primitive type causes a NullPointerException on unboxing – every primitive
+        // must be given an explicit zero-value instead.
         Class<?>[] params = ctorCommonListenerCookie.getParameterTypes();
         Object[] args = new Object[params.length];
         for (int i = 0; i < params.length; i++) {
             if (params[i].equals(GameProfile.class)) {
                 args[i] = profile;
-            } else if (params[i].equals(int.class) || params[i].equals(Integer.class)) {
-                args[i] = 0;
             } else if (clsClientInformation != null && params[i].equals(clsClientInformation)) {
                 Method createDefault = clsClientInformation.getMethod("createDefault");
                 args[i] = createDefault.invoke(null);
+            } else if (params[i].equals(boolean.class) || params[i].equals(Boolean.class)) {
+                args[i] = false;          // 'transferred' flag – always false for injected bots
+            } else if (params[i].equals(int.class) || params[i].equals(Integer.class)) {
+                args[i] = 0;             // latency
+            } else if (params[i].equals(long.class) || params[i].equals(Long.class)) {
+                args[i] = 0L;
+            } else if (params[i].equals(double.class) || params[i].equals(Double.class)) {
+                args[i] = 0.0;
+            } else if (params[i].equals(float.class) || params[i].equals(Float.class)) {
+                args[i] = 0.0f;
+            } else if (params[i].equals(byte.class) || params[i].equals(Byte.class)) {
+                args[i] = (byte) 0;
+            } else if (params[i].equals(short.class) || params[i].equals(Short.class)) {
+                args[i] = (short) 0;
             } else {
-                args[i] = null;
+                args[i] = null;           // safe for any remaining reference types
             }
         }
         return ctorCommonListenerCookie.newInstance(args);
