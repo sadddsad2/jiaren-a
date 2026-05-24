@@ -23,14 +23,15 @@
             <id>papermc</id>
             <url>https://repo.papermc.io/repository/maven-public/</url>
         </repository>
+        <!-- Mojang Authlib is hosted on minecraft-libraries -->
         <repository>
-            <id>codemc-repo</id>
-            <url>https://repo.codemc.io/repository/maven-releases/</url>
+            <id>minecraft-libraries</id>
+            <url>https://libraries.minecraft.net/</url>
         </repository>
     </repositories>
 
     <dependencies>
-        <!-- Paper API (provided by server) -->
+        <!-- Paper API – provided by the server jar at runtime -->
         <dependency>
             <groupId>io.papermc.paper</groupId>
             <artifactId>paper-api</artifactId>
@@ -39,20 +40,32 @@
         </dependency>
 
         <!--
-            PacketEvents – cross-version packet/NMS abstraction (1.20 ~ 1.21+).
-            We shade it into the jar so the server doesn't need it as a separate plugin.
+            Netty – lives inside the Paper server jar at runtime, but the compiler
+            needs it on the classpath during CI where there is no server jar.
+            Scope=provided so it is NOT included in our shaded jar.
         -->
         <dependency>
-            <groupId>com.github.retrooper</groupId>
-            <artifactId>packetevents-spigot</artifactId>
-            <version>2.5.0</version>
-            <scope>compile</scope>
+            <groupId>io.netty</groupId>
+            <artifactId>netty-all</artifactId>
+            <version>4.1.97.Final</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!--
+            Mojang Authlib – also bundled in the Paper server jar at runtime.
+            Needed at compile-time for GameProfile in VersionAdapter.
+            Scope=provided so it is NOT included in our shaded jar.
+        -->
+        <dependency>
+            <groupId>com.mojang</groupId>
+            <artifactId>authlib</artifactId>
+            <version>4.0.43</version>
+            <scope>provided</scope>
         </dependency>
     </dependencies>
 
     <build>
         <plugins>
-            <!-- Shade PacketEvents into our jar -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-shade-plugin</artifactId>
@@ -63,17 +76,6 @@
                         <goals><goal>shade</goal></goals>
                         <configuration>
                             <createDependencyReducedPom>false</createDependencyReducedPom>
-                            <relocations>
-                                <!-- Relocate to avoid conflicts with other plugins using PacketEvents -->
-                                <relocation>
-                                    <pattern>com.github.retrooper.packetevents</pattern>
-                                    <shadedPattern>com.example.fakeplayer.libs.packetevents</shadedPattern>
-                                </relocation>
-                                <relocation>
-                                    <pattern>io.github.retrooper.packetevents</pattern>
-                                    <shadedPattern>com.example.fakeplayer.libs.packetevents.bukkit</shadedPattern>
-                                </relocation>
-                            </relocations>
                         </configuration>
                     </execution>
                 </executions>
