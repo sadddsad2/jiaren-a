@@ -98,7 +98,8 @@ public class BotManager {
         try {
             bot.connect();
         } catch (Exception e) {
-            plugin.getLogger().log(Level.WARNING, "Failed to connect bot " + name + ": " + e.getMessage());
+            // Log full stack so protocol errors are visible in console
+            plugin.getLogger().log(Level.WARNING, "Failed to connect bot " + name, e);
             activeBots.remove(name);
             usedNames.remove(name);
         }

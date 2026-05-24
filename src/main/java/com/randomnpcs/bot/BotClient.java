@@ -13,15 +13,9 @@ import java.util.UUID;
 import java.util.logging.Level;
 
 /**
- * A single bot that connects to the Minecraft server over TCP using the
- * Minecraft protocol, then performs random chat and movement actions.
- *
- * Connection flow:
- *   Handshake (state=2 login) → Login Start → Login Success → Play
- *
- * Note: For offline-mode servers (online-mode=false) no encryption is needed.
- *       For online-mode servers, proper authentication would be required.
- *       This plugin targets offline/LAN servers as implied by SERVER_PORT usage.
+ * One fake-player bot.
+ * A single MinecraftProtocol instance is shared for the entire connection
+ * so compression state is not lost between sends.
  */
 public class BotClient {
 
@@ -34,222 +28,191 @@ public class BotClient {
     private final Random random = new Random();
 
     private Socket socket;
-    private DataOutputStream out;
-    private DataInputStream in;
+    private MinecraftProtocol proto; // one instance, lives as long as the socket
     private volatile boolean connected = false;
-    private volatile boolean alive = true;
+    private volatile boolean alive     = true;
 
-    // Scheduler tasks
     private BukkitTask chatTask;
     private BukkitTask actionTask;
-    private BukkitTask readTask;
 
-    // Bot state
+    // Current position (updated by server's synchronize-position packets)
     private double x, y, z;
-    private float yaw, pitch;
-    private boolean onGround = true;
+    private float  yaw, pitch;
 
     public BotClient(RandomBotsPlugin plugin, BotManager manager,
                      String name, String host, int port) {
-        this.plugin = plugin;
+        this.plugin  = plugin;
         this.manager = manager;
-        this.name = name;
-        this.host = host;
-        this.port = port;
-        this.uuid = UUID.nameUUIDFromBytes(("OfflinePlayer:" + name).getBytes());
+        this.name    = name;
+        this.host    = host;
+        this.port    = port;
+        this.uuid    = UUID.nameUUIDFromBytes(("OfflinePlayer:" + name).getBytes());
     }
 
-    /**
-     * Connect to the server and begin bot behavior.
-     */
+    /** Blocking connect + login. Throws on any failure so BotManager can log the real cause. */
     public void connect() throws IOException {
         socket = new Socket(host, port);
         socket.setTcpNoDelay(true);
-        socket.setSoTimeout(30000);
+        socket.setSoTimeout(60_000); // 60 s read timeout
 
-        out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
-        in  = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
+        DataOutputStream out = new DataOutputStream(
+                new BufferedOutputStream(socket.getOutputStream(), 8192));
+        DataInputStream in = new DataInputStream(
+                new BufferedInputStream(socket.getInputStream(), 8192));
 
-        // Perform Minecraft handshake + login
-        MinecraftProtocol proto = new MinecraftProtocol(in, out);
-        proto.sendHandshake(host, port);
-        proto.sendLoginStart(name, uuid);
+        // One proto instance shared for the whole connection
+        proto = new MinecraftProtocol(in, out, plugin.getLogger());
 
-        // Wait for Login Success / Set Compression
-        boolean loggedIn = proto.waitForLoginSuccess(name);
-        if (!loggedIn) {
+        proto.initiateLogin(host, port, name, uuid);
+
+        boolean ok = proto.completeLogin(name);
+        if (!ok) {
             socket.close();
-            throw new IOException("Login failed for bot: " + name);
+            throw new IOException("Login rejected (online-mode or banned) for: " + name);
         }
-
-        // Send Client Settings
-        proto.sendClientSettings();
 
         connected = true;
         plugin.getLogger().info("Bot connected: " + name);
 
-        // Start async packet reader
-        startPacketReader(proto);
-
-        // Schedule chat and action tasks on main thread (offloading I/O back to async)
+        startReaderThread();
         scheduleChatTask();
         scheduleActionTask();
     }
 
-    /** Async loop: read incoming packets to keep connection alive (handle keepalive). */
-    private void startPacketReader(MinecraftProtocol proto) {
-        Thread readerThread = new Thread(() -> {
+    // ── Async reader ────────────────────────────────────────────────────
+
+    private void startReaderThread() {
+        Thread t = new Thread(() -> {
             try {
                 while (connected && alive && !socket.isClosed()) {
-                    proto.readAndHandlePacket(this);
+                    proto.readAndHandle(this);
                 }
             } catch (Exception e) {
                 if (connected) {
-                    plugin.getLogger().info("Bot " + name + " disconnected: " + e.getMessage());
+                    plugin.getLogger().info("Bot " + name + " read error: " + e.getMessage());
                 }
             } finally {
                 handleDisconnect();
             }
-        }, "RandomBot-Reader-" + name);
-        readerThread.setDaemon(true);
-        readerThread.start();
+        }, "RandomBot-" + name);
+        t.setDaemon(true);
+        t.start();
     }
 
-    /** Periodically send a random chat message. */
+    // ── Scheduled behaviours ────────────────────────────────────────────
+
     private void scheduleChatTask() {
-        int minSec = plugin.getConfig().getInt("chat-interval-min", 15);
-        int maxSec = plugin.getConfig().getInt("chat-interval-max", 45);
-        long delayTicks = (minSec + random.nextInt(maxSec - minSec + 1)) * 20L;
+        int min = plugin.getConfig().getInt("chat-interval-min", 15);
+        int max = plugin.getConfig().getInt("chat-interval-max", 45);
+        long ticks = (min + random.nextInt(max - min + 1)) * 20L;
 
         chatTask = Bukkit.getScheduler().runTaskLaterAsynchronously(plugin, () -> {
-            if (!connected) return;
-            sendChat();
-            scheduleChatTask(); // reschedule with new random delay
-        }, delayTicks);
+            if (!connected || !alive) return;
+            sendRandomChat();
+            scheduleChatTask();
+        }, ticks);
     }
 
-    /** Periodically perform a random movement action. */
     private void scheduleActionTask() {
-        int minSec = plugin.getConfig().getInt("action-interval-min", 5);
-        int maxSec = plugin.getConfig().getInt("action-interval-max", 15);
-        long delayTicks = (minSec + random.nextInt(maxSec - minSec + 1)) * 20L;
+        int min = plugin.getConfig().getInt("action-interval-min", 5);
+        int max = plugin.getConfig().getInt("action-interval-max", 15);
+        long ticks = (min + random.nextInt(max - min + 1)) * 20L;
 
         actionTask = Bukkit.getScheduler().runTaskLaterAsynchronously(plugin, () -> {
-            if (!connected) return;
+            if (!connected || !alive) return;
             performRandomAction();
             scheduleActionTask();
-        }, delayTicks);
+        }, ticks);
     }
 
-    /** Pick and send a random chat message from config. */
-    private void sendChat() {
+    private void sendRandomChat() {
         List<String> messages = plugin.getConfig().getStringList("chat-messages");
         if (messages.isEmpty()) return;
-
         String msg = messages.get(random.nextInt(messages.size()));
         try {
-            MinecraftProtocol proto = new MinecraftProtocol(in, out);
             proto.sendChatMessage(msg);
-            plugin.getLogger().info("[Bot:" + name + "] says: " + msg);
+            plugin.getLogger().info("[Bot:" + name + "] " + msg);
         } catch (Exception e) {
-            plugin.getLogger().fine("Bot " + name + " chat error: " + e.getMessage());
+            plugin.getLogger().fine("[Bot:" + name + "] chat error: " + e.getMessage());
         }
     }
 
-    /** Perform a random action: walk, look around, jump, sneak. */
     private void performRandomAction() {
         int action = random.nextInt(5);
         try {
-            MinecraftProtocol proto = new MinecraftProtocol(in, out);
             switch (action) {
-                case 0 -> {
-                    // Walk a random direction
+                case 0 -> { // Walk
                     double dx = (random.nextDouble() - 0.5) * 4;
                     double dz = (random.nextDouble() - 0.5) * 4;
-                    x += dx;
-                    z += dz;
-                    yaw = (float)(Math.toDegrees(Math.atan2(-dx, dz)));
-                    proto.sendPositionAndLook(x, y, z, yaw, pitch, onGround);
-                    plugin.getLogger().fine("[Bot:" + name + "] walking to " + String.format("%.1f,%.1f,%.1f", x, y, z));
-                }
-                case 1 -> {
-                    // Look around
-                    yaw   = random.nextFloat() * 360f - 180f;
-                    pitch = random.nextFloat() * 60f - 30f;
-                    proto.sendLook(yaw, pitch, onGround);
-                    plugin.getLogger().fine("[Bot:" + name + "] looking yaw=" + String.format("%.1f", yaw));
-                }
-                case 2 -> {
-                    // Jump (move up then back)
-                    proto.sendPositionAndLook(x, y + 1.2, z, yaw, pitch, false);
-                    Thread.sleep(300);
+                    x += dx; z += dz;
+                    yaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
                     proto.sendPositionAndLook(x, y, z, yaw, pitch, true);
-                    plugin.getLogger().fine("[Bot:" + name + "] jumped");
                 }
-                case 3 -> {
-                    // Swing arm (attack animation)
+                case 1 -> { // Look around
+                    yaw   = random.nextFloat() * 360f - 180f;
+                    pitch = random.nextFloat() * 60f  - 30f;
+                    proto.sendLook(yaw, pitch, true);
+                }
+                case 2 -> { // Jump
+                    proto.sendPositionAndLook(x, y + 0.5, z, yaw, pitch, false);
+                    Thread.sleep(200);
+                    proto.sendPositionAndLook(x, y, z, yaw, pitch, true);
+                }
+                case 3 -> { // Swing arm
                     proto.sendSwingArm();
-                    plugin.getLogger().fine("[Bot:" + name + "] swung arm");
                 }
-                case 4 -> {
-                    // Sneak toggle
+                case 4 -> { // Sneak
                     proto.sendEntityAction(MinecraftProtocol.EntityAction.START_SNEAKING);
-                    Thread.sleep(500);
+                    Thread.sleep(600);
                     proto.sendEntityAction(MinecraftProtocol.EntityAction.STOP_SNEAKING);
-                    plugin.getLogger().fine("[Bot:" + name + "] sneaked");
                 }
             }
         } catch (Exception e) {
-            plugin.getLogger().fine("Bot " + name + " action error: " + e.getMessage());
+            plugin.getLogger().fine("[Bot:" + name + "] action error: " + e.getMessage());
         }
     }
 
-    /** Called when server sends a Respawn or Position packet — update bot coords. */
-    public void updatePosition(double x, double y, double z, float yaw, float pitch) {
-        this.x = x; this.y = y; this.z = z;
-        this.yaw = yaw; this.pitch = pitch;
-        // Confirm position to server
+    // ── Callbacks from proto ────────────────────────────────────────────
+
+    /** Called when server synchronizes the bot's position. We must confirm it. */
+    public void updatePosition(double nx, double ny, double nz, float ny2, float np) {
+        this.x = nx; this.y = ny; this.z = nz;
+        this.yaw = ny2; this.pitch = np;
         try {
-            MinecraftProtocol proto = new MinecraftProtocol(in, out);
             proto.sendPositionAndLook(x, y, z, yaw, pitch, true);
         } catch (Exception ignored) {}
     }
 
-    /** Called when server sends a Keepalive — must respond or get kicked. */
-    public void respondToKeepalive(long keepaliveId) {
-        try {
-            MinecraftProtocol proto = new MinecraftProtocol(in, out);
-            proto.sendKeepalive(keepaliveId);
-        } catch (Exception e) {
-            plugin.getLogger().fine("Keepalive response failed for " + name);
-        }
-    }
+    // ── Lifecycle ───────────────────────────────────────────────────────
 
-    /** Handle graceful or forced disconnect. */
     public void handleDisconnect() {
-        if (!alive) return; // already handled
-        alive = false;
+        if (!alive) return;
+        alive     = false;
         connected = false;
-
-        if (chatTask != null) chatTask.cancel();
-        if (actionTask != null) actionTask.cancel();
-
-        try { if (socket != null) socket.close(); } catch (Exception ignored) {}
-
-        plugin.getLogger().info("Bot " + name + " disconnected/died.");
+        cancelTasks();
+        closeSocket();
+        plugin.getLogger().info("Bot " + name + " disconnected — scheduling respawn.");
         manager.onBotDied(name);
     }
 
     public void disconnect(String reason) {
-        plugin.getLogger().info("Disconnecting bot " + name + ": " + reason);
-        alive = false;
+        alive     = false;
         connected = false;
-        if (chatTask != null) chatTask.cancel();
-        if (actionTask != null) actionTask.cancel();
-        try { if (socket != null) socket.close(); } catch (Exception ignored) {}
+        cancelTasks();
+        closeSocket();
         manager.removeBot(name);
     }
 
-    public String getBotName() { return name; }
+    private void cancelTasks() {
+        if (chatTask   != null) { chatTask.cancel();   chatTask   = null; }
+        if (actionTask != null) { actionTask.cancel(); actionTask = null; }
+    }
+
+    private void closeSocket() {
+        try { if (socket != null && !socket.isClosed()) socket.close(); }
+        catch (Exception ignored) {}
+    }
+
+    public String getBotName()   { return name;      }
     public boolean isConnected() { return connected; }
 }
