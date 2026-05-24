@@ -290,20 +290,15 @@ public class VersionAdapter {
     }
 
     private static Object buildDummyConnection() throws Exception {
-        // Must use PacketFlow.SERVERBOUND — same as Carpet Mod's FakeClientConnection.
-        // Connection(SERVERBOUND) sets sending=SERVERBOUND, receiving=CLIENTBOUND internally.
+        // Use PacketFlow.SERVERBOUND — same as Carpet Mod's FakeClientConnection.
         //
-        // Paper 1.21.x added Connection.validateListener() which checks that the listener's
-        // flow() matches connection.getReceiving(). Since placeNewPlayer installs a SERVERBOUND
-        // ServerGamePacketListenerImpl, and receiving=CLIENTBOUND, this would normally throw:
-        //   "connection is CLIENTBOUND, but listener is SERVERBOUND"
+        // Paper 1.21.x's setupInboundProtocol() has two problems for fake players:
+        //   1. validateListener() throws if listener.flow() != connection.receiving
+        //   2. syncAfterConfigurationChange() blocks main thread on channel.sync()
+        //      → server deadlock with a dummy/offline channel
         //
-        // Carpet Mod's fix: subclass Connection and override setupInboundProtocol() to skip
-        // validateListener(). We cannot subclass at compile time (no NMS on classpath), so we
-        // instead patch the Connection instance via reflection AFTER placeNewPlayer calls
-        // setupInboundProtocol — but that's too late. Instead we intercept the call by
-        // temporarily replacing the connection's "receiving" field with SERVERBOUND so the
-        // validation passes, then restore it. This is equivalent in effect.
+        // FakeConnection.setupInboundProtocol() is a no-op that skips both.
+        // This is identical in intent to Carpet Mod's FakeClientConnection approach.
         Class<?> clsPacketFlow = Class.forName("net.minecraft.network.protocol.PacketFlow");
         Object[] flowValues = clsPacketFlow.getEnumConstants();
         Object serverbound = null;
@@ -312,22 +307,12 @@ public class VersionAdapter {
         }
         if (serverbound == null) serverbound = flowValues[0];
 
-        // Build Connection(SERVERBOUND)
-        Object connection = ctorNetworkManager.newInstance(serverbound);
+        // FakeConnection overrides setupInboundProtocol() to skip validateListener()
+        // and syncAfterConfigurationChange() — the two Paper 1.21.x injection blockers.
+        FakeConnection connection = new FakeConnection(
+                (net.minecraft.network.protocol.PacketFlow) serverbound);
 
-        // Patch: find the "receiving" field inside Connection and set it to SERVERBOUND so
-        // validateListener() sees receiving==SERVERBOUND == listener.flow()==SERVERBOUND → passes.
-        // Field is named "receiving" in Mojmap; search common obfuscated names as fallback.
-        try {
-            Field receivingField = findField(clsNetworkManager, "receiving", "h", "c", "d");
-            receivingField.setAccessible(true);
-            receivingField.set(connection, serverbound);
-            LOG.fine("Patched Connection.receiving to SERVERBOUND for validateListener bypass.");
-        } catch (Exception e) {
-            LOG.warning("Could not patch Connection.receiving field — validateListener may fail: " + e.getMessage());
-        }
-
-        // Set a dummy channel so the server doesn't NPE on flush
+        // Set a dummy channel so disconnect / send paths don't NPE
         try {
             Field channelField = findField(clsNetworkManager, "channel", "k", "f");
             channelField.setAccessible(true);
@@ -336,7 +321,7 @@ public class VersionAdapter {
             LOG.fine("Could not set dummy channel: " + e.getMessage());
         }
 
-        // Set remote address field
+        // Set remote address
         try {
             Field addrField = findField(clsNetworkManager, "address", "m", "l");
             addrField.setAccessible(true);
