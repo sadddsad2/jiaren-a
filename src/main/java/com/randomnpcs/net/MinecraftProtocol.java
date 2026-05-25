@@ -3,6 +3,7 @@ package com.randomnpcs.net;
 import com.randomnpcs.bot.BotClient;
 
 import java.io.*;
+import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.UUID;
 import java.util.logging.Logger;
