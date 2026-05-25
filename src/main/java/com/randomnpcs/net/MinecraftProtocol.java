@@ -398,8 +398,8 @@ public class MinecraftProtocol {
         writeVarInt(b, 1);         // main hand: right
         b.write(0);                // text filtering: disabled
         b.write(1);                // server listings: enabled
-        // particle_status added in 1.21.5 (protocol 770+)
-        if (protocolVersion >= 770) writeVarInt(b, 2); // all particles
+        // particle_status added in 1.21.5 (protocol 774)
+        if (protocolVersion >= 774) writeVarInt(b, 2); // all particles
         return b.toByteArray();
     }
 
