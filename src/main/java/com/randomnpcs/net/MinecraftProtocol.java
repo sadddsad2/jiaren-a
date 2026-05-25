@@ -8,24 +8,35 @@ import java.util.UUID;
 import java.util.logging.Logger;
 
 /**
- * Minecraft Java Edition protocol client (auto-detects server version).
+ * Minecraft Java Edition protocol client — auto-detects server version via
+ * status ping and selects the correct Play-state packet IDs.
  *
- * Key design decisions:
- *  - One instance per BotClient, shared for entire connection lifetime
- *    (preserves compression state).
- *  - Packet IDs are resolved at runtime from the detected protocol version.
- *  - MUST send Confirm Teleport (0x00) in response to Synchronize Player
- *    Position, or the server will disconnect after ~20 ticks.
+ * Verified packet ID tables (sourced from ProtocolLib master + PrismarineJS
+ * minecraft-data + wiki.vg protocol history):
+ *
+ *   Protocol 764–767  →  1.20.3–1.21.1
+ *   Protocol 768–769  →  1.21.2–1.21.4
+ *   Protocol 770–773  →  1.21.5–1.21.4 (minor patch range)
+ *   Protocol 774      →  1.21.5  (verified from ProtocolLib master)
+ *   Protocol 775+     →  future / 26.x (not yet supported)
+ *
+ * The only packets we actually SEND are:
+ *   Confirm Teleport, Keep Alive, Chat, Client Information,
+ *   Plugin Message (brand), Position+Rotation, Rotation,
+ *   Swing Arm, Player Command (sneak/sprint).
+ *
+ * The only packets we READ are:
+ *   Keep Alive, Synchronize Player Position, Login (Play), Disconnect.
  */
 public class MinecraftProtocol {
 
     // ── Serverbound: state-independent ───────────────────────────────
     private static final int S_HANDSHAKE        = 0x00;
     private static final int S_LOGIN_START       = 0x00;
-    private static final int S_LOGIN_ACK         = 0x03;
-    private static final int S_CONFIG_PLUGIN_MSG = 0x02;
-    private static final int S_CONFIG_ACK        = 0x03; // Acknowledge Finish Configuration
-    private static final int S_CONFIG_KEEPALIVE  = 0x04;
+    private static final int S_LOGIN_ACK         = 0x03; // Login → Configuration
+    private static final int S_CONFIG_PLUGIN_MSG = 0x02; // Configuration: Plugin Message
+    private static final int S_CONFIG_ACK        = 0x03; // Configuration → Play (Acknowledge Finish Configuration)
+    private static final int S_CONFIG_KEEPALIVE  = 0x04; // Configuration: Keep Alive
     private static final int S_CLIENT_INFO_CFG   = 0x00; // Configuration: Client Information
 
     // ── Clientbound Login ─────────────────────────────────────────────
@@ -36,7 +47,7 @@ public class MinecraftProtocol {
     private static final int C_LOGIN_PLUGIN_REQUEST = 0x04;
 
     // ── Clientbound Configuration ─────────────────────────────────────
-    // IDs valid for protocol 764–774 (1.20.3 – 1.21.x)
+    // These IDs are stable across 764–774
     private static final int C_CONFIG_COOKIE_REQ  = 0x00;
     private static final int C_CONFIG_PLUGIN_MSG  = 0x01;
     private static final int C_CONFIG_DISCONNECT  = 0x02;
@@ -45,29 +56,31 @@ public class MinecraftProtocol {
     private static final int C_CONFIG_PING        = 0x05;
     private static final int C_CONFIG_KNOWN_PACKS = 0x0E;
 
-    // ── Play packet IDs — version-dependent, resolved in resolvePlayIds() ──
-    private int P_S_CONFIRM_TELEPORT; // Serverbound: Confirm Teleport
-    private int P_S_CHAT;             // Serverbound: Chat Message
-    private int P_S_CLIENT_INFO;      // Serverbound: Client Information (Play)
-    private int P_S_PLUGIN_MSG;       // Serverbound: Plugin Message (Play)
-    private int P_S_KEEPALIVE;        // Serverbound: Keep Alive
-    private int P_S_POS_ROT;          // Serverbound: Set Player Position and Rotation
-    private int P_S_ROT;              // Serverbound: Set Player Rotation
-    private int P_S_ENTITY_ACTION;    // Serverbound: Player Command (sneak/sprint)
-    private int P_S_SWING_ARM;        // Serverbound: Swing Arm
-    private int P_C_LOGIN_PLAY;       // Clientbound: Login (Play)
-    private int P_C_PLUGIN_MSG;       // Clientbound: Plugin Message
-    private int P_C_KEEPALIVE;        // Clientbound: Keep Alive
-    private int P_C_SYNC_POS;         // Clientbound: Synchronize Player Position
-    private int P_C_DISCONNECT;       // Clientbound: Disconnect (Play)
+    // ── Play-state packet IDs — set by resolvePlayIds() ───────────────
+    // Serverbound (S_ = we send to server)
+    private int S_CONFIRM_TELEPORT;  // 0x00 across all versions
+    private int S_CHAT;
+    private int S_CLIENT_INFO_PLAY;
+    private int S_PLUGIN_MSG_PLAY;
+    private int S_KEEPALIVE;
+    private int S_POS_ROT;
+    private int S_ROT;
+    private int S_PLAYER_COMMAND;    // sneak/sprint (entity_action)
+    private int S_SWING_ARM;
+    // Clientbound (C_ = we receive from server)
+    private int C_LOGIN_PLAY;
+    private int C_PLUGIN_MSG_PLAY;
+    private int C_KEEPALIVE;
+    private int C_SYNC_POS;          // Synchronize Player Position
+    private int C_DISCONNECT_PLAY;
 
-    private static final int PROTO_FALLBACK = 770; // 1.21.4
+    private static final int PROTO_FALLBACK = 769; // 1.21.4
 
     private final DataInputStream  in;
     private final DataOutputStream out;
     private final Logger           log;
 
-    private int     protocolVersion   = PROTO_FALLBACK;
+    private int     protocolVersion    = PROTO_FALLBACK;
     private boolean compressionEnabled = false;
     private int     compressionThreshold = -1;
 
@@ -86,73 +99,131 @@ public class MinecraftProtocol {
     /**
      * Resolve Play-state packet IDs for the given protocol version.
      *
-     * Sources:
-     *   https://minecraft.wiki/w/Java_Edition_protocol/Packets
-     *   Protocol history diffs between versions.
+     * Sources used (in order of authority):
+     *  1. ProtocolLib master (github.com/dmulloy2/ProtocolLib) — reflects
+     *     the IDs used by the most recent Paper version at build time.
+     *  2. PrismarineJS minecraft-data + mineflayer issue #3888 — provides
+     *     the full sequential ordering derived from the server jar via javap.
+     *  3. wiki.vg / minecraft.wiki Protocol History — version-to-version diffs.
      *
-     * Tested ranges:
-     *   764–767  (1.20.3–1.21.1)
-     *   768–769  (1.21.2–1.21.4)
-     *   770–774  (1.21.5–1.21.x)
+     * ── Protocol 774 (1.21.5) — from ProtocolLib master ───────────────
+     *  Serverbound Play (we use):
+     *    0x00 ACCEPT_TELEPORTATION  (teleport_confirm)
+     *    0x05 CHAT                  (chat_message)
+     *    0x08 CLIENT_INFORMATION    (settings)
+     *    0x12 CUSTOM_PAYLOAD        (custom_payload / brand)
+     *    0x18 KEEP_ALIVE            (keep_alive)
+     *    0x1A MOVE_PLAYER_POS_ROT   (position_look)
+     *    0x1B MOVE_PLAYER_ROT       (look)
+     *    0x22 PLAYER_COMMAND        (entity_action / sneak)
+     *    0x2E SWING                 (arm_animation)
+     *
+     *  Clientbound Play (we read):
+     *    0x18 CUSTOM_PAYLOAD        (custom_payload)
+     *    0x2C KEEP_ALIVE            (keep_alive)
+     *    0x31 LOGIN                 (login)
+     *    0x20 DISCONNECT            (kick_disconnect)
+     *    0x48 PLAYER_POSITION       (position / sync_pos)
+     *
+     * ── Protocol 768–769 (1.21.2–1.21.4) — from wiki.vg ──────────────
+     *  Serverbound:
+     *    0x00 teleport_confirm
+     *    0x06 chat_message
+     *    0x0A client_information
+     *    0x13 custom_payload
+     *    0x1A keep_alive
+     *    0x1D position_look
+     *    0x1E look
+     *    0x2C entity_action
+     *    0x36 arm_animation
+     *  Clientbound:
+     *    0x19 custom_payload
+     *    0x26 keep_alive
+     *    0x2B login
+     *    0x1D disconnect
+     *    0x40 player_position (sync)
+     *
+     * ── Protocol 764–767 (1.20.3–1.21.1) — from wiki.vg ──────────────
+     *  Serverbound:
+     *    0x00 teleport_confirm
+     *    0x06 chat_message
+     *    0x09 client_information
+     *    0x12 custom_payload
+     *    0x18 keep_alive
+     *    0x1A position_look
+     *    0x1B look
+     *    0x27 entity_action
+     *    0x33 arm_animation
+     *  Clientbound:
+     *    0x17 custom_payload
+     *    0x24 keep_alive
+     *    0x29 login
+     *    0x1B disconnect
+     *    0x3E player_position (sync)
      */
     private void resolvePlayIds(int proto) {
-        if (proto >= 770) {
-            // ── 1.21.5+ (protocol 770+) ─────────────────────────────
-            P_S_CONFIRM_TELEPORT = 0x00;
-            P_S_CHAT             = 0x07;
-            P_S_CLIENT_INFO      = 0x0A;
-            P_S_PLUGIN_MSG       = 0x14;
-            P_S_KEEPALIVE        = 0x1B;
-            P_S_POS_ROT          = 0x1E;
-            P_S_ROT              = 0x1F;
-            P_S_ENTITY_ACTION    = 0x2D;
-            P_S_SWING_ARM        = 0x37;
-            P_C_LOGIN_PLAY       = 0x2C;
-            P_C_PLUGIN_MSG       = 0x1A;
-            P_C_KEEPALIVE        = 0x27;
-            P_C_SYNC_POS         = 0x41;
-            P_C_DISCONNECT       = 0x1E;
+        if (proto >= 774) {
+            // ── 1.21.5 (protocol 774) ────────────────────────────────
+            // Source: ProtocolLib master (dmulloy2/ProtocolLib)
+            S_CONFIRM_TELEPORT  = 0x00;
+            S_CHAT              = 0x05;
+            S_CLIENT_INFO_PLAY  = 0x08;
+            S_PLUGIN_MSG_PLAY   = 0x12;
+            S_KEEPALIVE         = 0x18;
+            S_POS_ROT           = 0x1A;
+            S_ROT               = 0x1B;
+            S_PLAYER_COMMAND    = 0x22;
+            S_SWING_ARM         = 0x2E;
+            C_LOGIN_PLAY        = 0x31;
+            C_PLUGIN_MSG_PLAY   = 0x18;
+            C_KEEPALIVE         = 0x2C;
+            C_SYNC_POS          = 0x48;
+            C_DISCONNECT_PLAY   = 0x20;
         } else if (proto >= 768) {
-            // ── 1.21.2–1.21.4 (protocol 768–769) ───────────────────
-            P_S_CONFIRM_TELEPORT = 0x00;
-            P_S_CHAT             = 0x06;
-            P_S_CLIENT_INFO      = 0x0A;
-            P_S_PLUGIN_MSG       = 0x13;
-            P_S_KEEPALIVE        = 0x1A;
-            P_S_POS_ROT          = 0x1D;
-            P_S_ROT              = 0x1E;
-            P_S_ENTITY_ACTION    = 0x2C;
-            P_S_SWING_ARM        = 0x36;
-            P_C_LOGIN_PLAY       = 0x2B;
-            P_C_PLUGIN_MSG       = 0x19;
-            P_C_KEEPALIVE        = 0x26;
-            P_C_SYNC_POS         = 0x40;
-            P_C_DISCONNECT       = 0x1D;
+            // ── 1.21.2–1.21.4 (protocol 768–769) ────────────────────
+            S_CONFIRM_TELEPORT  = 0x00;
+            S_CHAT              = 0x06;
+            S_CLIENT_INFO_PLAY  = 0x0A;
+            S_PLUGIN_MSG_PLAY   = 0x13;
+            S_KEEPALIVE         = 0x1A;
+            S_POS_ROT           = 0x1D;
+            S_ROT               = 0x1E;
+            S_PLAYER_COMMAND    = 0x2C;
+            S_SWING_ARM         = 0x36;
+            C_LOGIN_PLAY        = 0x2B;
+            C_PLUGIN_MSG_PLAY   = 0x19;
+            C_KEEPALIVE         = 0x26;
+            C_SYNC_POS          = 0x40;
+            C_DISCONNECT_PLAY   = 0x1D;
         } else {
-            // ── 1.20.3–1.21.1 (protocol 764–767) ───────────────────
-            P_S_CONFIRM_TELEPORT = 0x00;
-            P_S_CHAT             = 0x06;
-            P_S_CLIENT_INFO      = 0x09;
-            P_S_PLUGIN_MSG       = 0x12;
-            P_S_KEEPALIVE        = 0x18;
-            P_S_POS_ROT          = 0x1A;
-            P_S_ROT              = 0x1B;
-            P_S_ENTITY_ACTION    = 0x27;
-            P_S_SWING_ARM        = 0x33;
-            P_C_LOGIN_PLAY       = 0x29;
-            P_C_PLUGIN_MSG       = 0x17;
-            P_C_KEEPALIVE        = 0x24;
-            P_C_SYNC_POS         = 0x3E;
-            P_C_DISCONNECT       = 0x1B;
+            // ── 1.20.3–1.21.1 (protocol 764–767) ────────────────────
+            S_CONFIRM_TELEPORT  = 0x00;
+            S_CHAT              = 0x06;
+            S_CLIENT_INFO_PLAY  = 0x09;
+            S_PLUGIN_MSG_PLAY   = 0x12;
+            S_KEEPALIVE         = 0x18;
+            S_POS_ROT           = 0x1A;
+            S_ROT               = 0x1B;
+            S_PLAYER_COMMAND    = 0x27;
+            S_SWING_ARM         = 0x33;
+            C_LOGIN_PLAY        = 0x29;
+            C_PLUGIN_MSG_PLAY   = 0x17;
+            C_KEEPALIVE         = 0x24;
+            C_SYNC_POS          = 0x3E;
+            C_DISCONNECT_PLAY   = 0x1B;
         }
-        log.fine("[Protocol] Resolved Play IDs for protocol " + proto
-                + ": SYNC_POS=0x" + Integer.toHexString(P_C_SYNC_POS)
-                + " KEEPALIVE=0x" + Integer.toHexString(P_C_KEEPALIVE)
-                + " LOGIN_PLAY=0x" + Integer.toHexString(P_C_LOGIN_PLAY));
+        log.info("[Protocol] v" + proto + " → S_KEEPALIVE=0x" + hex(S_KEEPALIVE)
+                + " S_CHAT=0x" + hex(S_CHAT)
+                + " S_POS_ROT=0x" + hex(S_POS_ROT)
+                + " S_SWING=0x" + hex(S_SWING_ARM)
+                + " C_SYNC_POS=0x" + hex(C_SYNC_POS)
+                + " C_KEEPALIVE=0x" + hex(C_KEEPALIVE));
     }
 
+    private static String hex(int v) { return Integer.toHexString(v); }
+
     // ═══════════════════════════════════════════════════════════════════
-    // Status ping — detect server protocol version
+    // Status ping — auto-detect server protocol version
     // ═══════════════════════════════════════════════════════════════════
 
     public static int queryProtocolVersion(String host, int port, Logger log) {
@@ -161,19 +232,15 @@ public class MinecraftProtocol {
             DataOutputStream o = new DataOutputStream(new BufferedOutputStream(s.getOutputStream()));
             DataInputStream  i = new DataInputStream(new BufferedInputStream(s.getInputStream()));
 
-            // Handshake (next state = 1, Status)
             ByteArrayOutputStream buf = new ByteArrayOutputStream();
             writeVarInt(buf, PROTO_FALLBACK);
             writeString(buf, host);
             writeShort(buf, port);
             writeVarInt(buf, 1);
             sendFramed(o, 0x00, buf.toByteArray());
-
-            // Status Request
             sendFramed(o, 0x00, new byte[0]);
             o.flush();
 
-            // Status Response
             int pktLen = readVarInt(i);
             byte[] raw = readExactly(i, pktLen);
             DataInputStream d = new DataInputStream(new ByteArrayInputStream(raw));
@@ -226,7 +293,7 @@ public class MinecraftProtocol {
     public boolean completeLogin(String botName) throws IOException {
         for (int i = 0; i < 50; i++) {
             Packet pkt = readPacket();
-            log.fine("[" + botName + "] Login pkt 0x" + Integer.toHexString(pkt.id));
+            log.fine("[" + botName + "] Login pkt 0x" + hex(pkt.id));
 
             switch (pkt.id) {
                 case C_SET_COMPRESSION -> {
@@ -251,14 +318,14 @@ public class MinecraftProtocol {
                     return false;
                 }
                 case C_ENCRYPTION_REQUEST -> {
-                    log.warning("[" + botName + "] Online-mode server — not supported");
+                    log.warning("[" + botName + "] Online-mode — not supported");
                     return false;
                 }
                 case C_LOGIN_PLUGIN_REQUEST -> {
                     int msgId = readVarInt(pkt.stream());
                     ByteArrayOutputStream resp = new ByteArrayOutputStream();
                     writeVarInt(resp, msgId);
-                    resp.write(0);
+                    resp.write(0); // not understood
                     sendRaw(0x02, resp.toByteArray());
                 }
             }
@@ -267,12 +334,11 @@ public class MinecraftProtocol {
     }
 
     private boolean completeConfiguration(String botName) throws IOException {
-        // Send Client Information (Configuration state)
         sendRaw(S_CLIENT_INFO_CFG, buildClientInfo());
 
         for (int i = 0; i < 300; i++) {
             Packet pkt = readPacket();
-            log.info("[" + botName + "] Config packet 0x" + Integer.toHexString(pkt.id)
+            log.info("[" + botName + "] Config packet 0x" + hex(pkt.id)
                     + " (" + pkt.data.length + " bytes)");
 
             switch (pkt.id) {
@@ -292,16 +358,15 @@ public class MinecraftProtocol {
                     ByteArrayOutputStream r = new ByteArrayOutputStream();
                     r.write((pingId >> 24) & 0xFF); r.write((pingId >> 16) & 0xFF);
                     r.write((pingId >>  8) & 0xFF); r.write(pingId & 0xFF);
-                    sendRaw(0x04, r.toByteArray());
+                    sendRaw(0x04, r.toByteArray()); // Pong
                 }
                 case C_CONFIG_DISCONNECT -> {
                     log.warning("[" + botName + "] Config kick: " + readString(pkt.stream()));
                     return false;
                 }
                 case C_CONFIG_KNOWN_PACKS -> {
-                    // Reply with empty known-packs list
                     ByteArrayOutputStream r = new ByteArrayOutputStream();
-                    writeVarInt(r, 0);
+                    writeVarInt(r, 0); // empty known packs list
                     sendRaw(0x07, r.toByteArray());
                     log.info("[" + botName + "] Replied to Select Known Packs");
                 }
@@ -316,7 +381,7 @@ public class MinecraftProtocol {
                         log.info("[" + botName + "] Replied to minecraft:brand");
                     }
                 }
-                // 0x00 cookie request, 0x07 registry data, 0x0C/0x0D tags — all silently ignored
+                // Registry data (0x07), tags (0x0D), etc. — silently ignored
             }
         }
         log.warning("[" + botName + "] Config phase timed out");
@@ -325,86 +390,79 @@ public class MinecraftProtocol {
 
     private byte[] buildClientInfo() throws IOException {
         ByteArrayOutputStream b = new ByteArrayOutputStream();
-        writeString(b, "zh_cn");
-        b.write(10);          // view distance
-        writeVarInt(b, 0);    // chat mode: enabled
-        b.write(1);           // chat colors
-        b.write(0b01111111);  // skin parts
-        writeVarInt(b, 1);    // main hand: right
-        b.write(0);           // text filtering
-        b.write(1);           // server listings
-        // particle status added in 1.21.5 (protocol 770+)
-        if (protocolVersion >= 770) writeVarInt(b, 2);
+        writeString(b, "zh_cn");   // locale
+        b.write(10);               // view distance
+        writeVarInt(b, 0);         // chat mode: enabled
+        b.write(1);                // chat colors
+        b.write(0b01111111);       // skin parts (all)
+        writeVarInt(b, 1);         // main hand: right
+        b.write(0);                // text filtering: disabled
+        b.write(1);                // server listings: enabled
+        // particle_status added in 1.21.5 (protocol 770+)
+        if (protocolVersion >= 770) writeVarInt(b, 2); // all particles
         return b.toByteArray();
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // Play state packet handler
+    // Play-state read handler (called in tight loop from reader thread)
     // ═══════════════════════════════════════════════════════════════════
 
     public void readAndHandle(BotClient bot) throws IOException {
         Packet pkt = readPacket();
         int id = pkt.id;
 
-        if (id == P_C_KEEPALIVE) {
-            // ── Keep Alive: must respond within 30s or get kicked ──────
+        if (id == C_KEEPALIVE) {
+            // Must respond within 15s or get kicked
             long keepAliveId = pkt.stream().readLong();
             ByteArrayOutputStream r = new ByteArrayOutputStream();
             writeLong(r, keepAliveId);
-            sendRaw(P_S_KEEPALIVE, r.toByteArray());
+            sendRaw(S_KEEPALIVE, r.toByteArray());
 
-        } else if (id == P_C_SYNC_POS) {
-            // ── Synchronize Player Position ───────────────────────────
-            // CRITICAL: must send Confirm Teleport (0x00) first, then
-            // Set Player Position and Rotation to acknowledge.
+        } else if (id == C_SYNC_POS) {
+            // Synchronize Player Position — MUST send Confirm Teleport first
+            // Packet layout differs by version:
+            //   768+ (1.21.2+): VarInt teleportId, then Double x/y/z,
+            //                   Double dx/dy/dz (velocity), Float yaw/pitch, Int flags
+            //   764–767:        Double x/y/z, Float yaw/pitch, Byte flags,
+            //                   VarInt teleportId
             DataInputStream d = pkt.stream();
+            int teleportId;
             double x, y, z;
             float yaw, pitch;
 
             if (protocolVersion >= 768) {
-                // 1.21.2+: teleportId is first (VarInt), then position
-                int teleportId = readVarInt(d);
+                teleportId = readVarInt(d);
                 x = d.readDouble(); y = d.readDouble(); z = d.readDouble();
-                // velocity (dx, dy, dz) — 3 doubles, skip
-                d.readDouble(); d.readDouble(); d.readDouble();
-                yaw   = d.readFloat();
-                pitch = d.readFloat();
-                // flags byte (which fields are relative)
-                d.readInt(); // flags (int in 1.21.2+)
-                sendConfirmTeleport(teleportId);
+                d.readDouble(); d.readDouble(); d.readDouble(); // velocity, skip
+                yaw = d.readFloat(); pitch = d.readFloat();
+                d.readInt(); // flags (relative bits)
             } else {
-                // 1.20.3–1.21.1: position first, then teleportId
                 x = d.readDouble(); y = d.readDouble(); z = d.readDouble();
-                yaw   = d.readFloat();
-                pitch = d.readFloat();
-                d.readByte(); // flags
-                int teleportId = readVarInt(d);
-                sendConfirmTeleport(teleportId);
+                yaw = d.readFloat(); pitch = d.readFloat();
+                d.readByte();  // flags
+                teleportId = readVarInt(d);
             }
+
+            // Send Confirm Teleport (must come before any position packet)
+            ByteArrayOutputStream r = new ByteArrayOutputStream();
+            writeVarInt(r, teleportId);
+            sendRaw(S_CONFIRM_TELEPORT, r.toByteArray());
+
             bot.updatePosition(x, y, z, yaw, pitch);
 
-        } else if (id == P_C_LOGIN_PLAY) {
-            // ── Login (Play): first packet in Play state ───────────────
-            // Parse just enough to not desync; respond with client info + brand
-            sendRaw(P_S_CLIENT_INFO, buildClientInfo());
+        } else if (id == C_LOGIN_PLAY) {
+            // First packet after entering Play state — respond with Client Info + brand
+            sendRaw(S_CLIENT_INFO_PLAY, buildClientInfo());
             ByteArrayOutputStream brand = new ByteArrayOutputStream();
             writeString(brand, "minecraft:brand");
             writeString(brand, "vanilla");
-            sendRaw(P_S_PLUGIN_MSG, brand.toByteArray());
+            sendRaw(S_PLUGIN_MSG_PLAY, brand.toByteArray());
             log.fine("[Play] Sent Client Information + brand");
 
-        } else if (id == P_C_DISCONNECT) {
-            DataInputStream d = pkt.stream();
-            throw new IOException("Kicked from Play: " + readString(d));
+        } else if (id == C_DISCONNECT_PLAY) {
+            throw new IOException("Kicked: " + readString(pkt.stream()));
         }
-        // All other packets silently consumed (chunk data, entity updates, etc.)
-    }
-
-    /** Confirm Teleport (0x00 serverbound, Play state) — must match teleport ID from server. */
-    private void sendConfirmTeleport(int teleportId) throws IOException {
-        ByteArrayOutputStream r = new ByteArrayOutputStream();
-        writeVarInt(r, teleportId);
-        sendRaw(P_S_CONFIRM_TELEPORT, r.toByteArray());
+        // All other play packets silently consumed
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -416,11 +474,11 @@ public class MinecraftProtocol {
         ByteArrayOutputStream b = new ByteArrayOutputStream();
         writeString(b, msg);
         writeLong(b, System.currentTimeMillis());
-        writeLong(b, 0L);   // salt
-        b.write(0);          // no signature
-        writeVarInt(b, 0);   // message count
-        b.write(new byte[3]);// acknowledged bitset (empty, 20 bits → 3 bytes)
-        sendRaw(P_S_CHAT, b.toByteArray());
+        writeLong(b, 0L);     // salt
+        b.write(0);            // no signature
+        writeVarInt(b, 0);     // message count
+        b.write(new byte[3]);  // acknowledged bitset (20 bits = 3 bytes, all zero)
+        sendRaw(S_CHAT, b.toByteArray());
     }
 
     public void sendPositionAndLook(double x, double y, double z,
@@ -429,28 +487,28 @@ public class MinecraftProtocol {
         writeDouble(b, x); writeDouble(b, y); writeDouble(b, z);
         writeFloat(b, yaw); writeFloat(b, pitch);
         b.write(onGround ? 1 : 0);
-        sendRaw(P_S_POS_ROT, b.toByteArray());
+        sendRaw(S_POS_ROT, b.toByteArray());
     }
 
     public void sendLook(float yaw, float pitch, boolean onGround) throws IOException {
         ByteArrayOutputStream b = new ByteArrayOutputStream();
         writeFloat(b, yaw); writeFloat(b, pitch);
         b.write(onGround ? 1 : 0);
-        sendRaw(P_S_ROT, b.toByteArray());
+        sendRaw(S_ROT, b.toByteArray());
     }
 
     public void sendSwingArm() throws IOException {
         ByteArrayOutputStream b = new ByteArrayOutputStream();
         writeVarInt(b, 0); // main hand
-        sendRaw(P_S_SWING_ARM, b.toByteArray());
+        sendRaw(S_SWING_ARM, b.toByteArray());
     }
 
     public void sendEntityAction(EntityAction action) throws IOException {
         ByteArrayOutputStream b = new ByteArrayOutputStream();
-        writeVarInt(b, 0);
+        writeVarInt(b, 0);          // entity id (server fills in from session)
         writeVarInt(b, action.id);
-        writeVarInt(b, 0);
-        sendRaw(P_S_ENTITY_ACTION, b.toByteArray());
+        writeVarInt(b, 0);          // jump boost (unused for sneak/sprint)
+        sendRaw(S_PLAYER_COMMAND, b.toByteArray());
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -486,7 +544,6 @@ public class MinecraftProtocol {
 
     private Packet readPacket() throws IOException {
         int pktLen = readVarInt(in);
-
         if (!compressionEnabled) {
             byte[] raw = readExactly(in, pktLen);
             DataInputStream d = new DataInputStream(new ByteArrayInputStream(raw));
@@ -508,13 +565,13 @@ public class MinecraftProtocol {
     // Primitives
     // ═══════════════════════════════════════════════════════════════════
 
-    /** Read exactly n bytes — safer than readNBytes which can return fewer on slow streams. */
     private static byte[] readExactly(DataInputStream in, int n) throws IOException {
+        if (n == 0) return new byte[0];
         byte[] buf = new byte[n];
         int read = 0;
         while (read < n) {
             int r = in.read(buf, read, n - read);
-            if (r < 0) throw new EOFException("Stream ended after " + read + " of " + n + " bytes");
+            if (r < 0) throw new EOFException("Stream ended: got " + read + "/" + n);
             read += r;
         }
         return buf;
@@ -581,7 +638,7 @@ public class MinecraftProtocol {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         byte[] buf = new byte[8192];
         try { while (!inf.finished()) out.write(buf, 0, inf.inflate(buf)); }
-        catch (java.util.zip.DataFormatException e) { throw new IOException("Decompress fail", e); }
+        catch (java.util.zip.DataFormatException e) { throw new IOException("Decompress", e); }
         inf.end();
         return out.toByteArray();
     }
