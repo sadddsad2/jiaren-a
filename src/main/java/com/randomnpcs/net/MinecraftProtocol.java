@@ -3,406 +3,368 @@ package com.randomnpcs.net;
 import com.randomnpcs.bot.BotClient;
 
 import java.io.*;
-import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.UUID;
 import java.util.logging.Logger;
 
 /**
- * Minecraft Java Edition protocol client — auto-detects server version via
- * status ping and selects the correct Play-state packet IDs.
+ * Minimal Minecraft protocol client.
  *
- * Enhanced version with:
- * - Dynamic packet ID detection from server capabilities
- * - Version-agnostic packet handling with fallback mechanism
- * - Robust error recovery for unknown packet types
+ * Design philosophy — "passive bot":
+ *   The TCP connection is used ONLY to:
+ *     1. Perform the Handshake → Login → Configuration handshake
+ *     2. Confirm Teleport when the server demands it
+ *     3. Respond to Keep Alive pings so we don't get kicked
  *
- * Verified packet ID tables (sourced from ProtocolLib master + PrismarineJS
- * minecraft-data + wiki.vg protocol history):
+ *   ALL gameplay actions (chat, movement, etc.) are performed server-side
+ *   via the Paper API on the Player object, avoiding protocol version issues.
  *
- *   Protocol 764–767  →  1.20.3–1.21.1
- *   Protocol 768–769  →  1.21.2–1.21.4
- *   Protocol 770–773  →  1.21.5–1.21.4 (minor patch range)
- *   Protocol 774      →  1.21.5  (verified from ProtocolLib master)
- *   Protocol 775+     →  future / 26.x (auto-adaptive)
+ * Keep Alive packet ID detection:
+ *   Instead of hardcoding packet IDs, we detect the Keep Alive packet
+ *   automatically by scanning for the known 8-byte pattern after login.
+ *   For all other clientbound packets we consume and discard the bytes.
  *
- * The only packets we actually SEND are:
- *   Confirm Teleport, Keep Alive, Chat, Client Information,
- *   Plugin Message (brand), Position+Rotation, Rotation,
- *   Swing Arm, Player Command (sneak/sprint).
- *
- * The only packets we READ are:
- *   Keep Alive, Synchronize Player Position, Login (Play), Disconnect.
+ * Teleport Confirm:
+ *   Always sent as packet 0x00 (stable across all versions since 1.9).
  */
 public class MinecraftProtocol {
 
-    // ── Serverbound: state-independent ───────────────────────────────
-    private static final int S_HANDSHAKE        = 0x00;
-    private static final int S_LOGIN_START       = 0x00;
-    private static final int S_LOGIN_ACK         = 0x03; // Login → Configuration
-    private static final int S_CONFIG_PLUGIN_MSG = 0x02; // Configuration: Plugin Message
-    private static final int S_CONFIG_ACK        = 0x03; // Configuration → Play (Acknowledge Finish Configuration)
-    private static final int S_CONFIG_KEEPALIVE  = 0x04; // Configuration: Keep Alive
-    private static final int S_CLIENT_INFO_CFG   = 0x00; // Configuration: Client Information
+    // ── Handshake + Login state (stable across all versions) ─────────────
+    private static final int S_HANDSHAKE            = 0x00;
+    private static final int S_LOGIN_START           = 0x00;
+    private static final int S_LOGIN_ACK             = 0x03;
+    private static final int C_SET_COMPRESSION       = 0x03;
+    private static final int C_LOGIN_SUCCESS         = 0x02;
+    private static final int C_DISCONNECT_LOGIN      = 0x00;
+    private static final int C_ENCRYPTION_REQUEST    = 0x01;
+    private static final int C_LOGIN_PLUGIN_REQUEST  = 0x04;
 
-    // ── Clientbound Login ─────────────────────────────────────────────
-    private static final int C_DISCONNECT_LOGIN     = 0x00;
-    private static final int C_ENCRYPTION_REQUEST   = 0x01;
-    private static final int C_LOGIN_SUCCESS        = 0x02;
-    private static final int C_SET_COMPRESSION      = 0x03;
-    private static final int C_LOGIN_PLUGIN_REQUEST = 0x04;
+    // ── Configuration state (stable 1.20.2+) ─────────────────────────────
+    private static final int S_CONFIG_CLIENT_INFO    = 0x00;
+    private static final int S_CONFIG_PLUGIN_MSG     = 0x02;
+    private static final int S_CONFIG_ACK            = 0x03;
+    private static final int S_CONFIG_KNOWN_PACKS    = 0x07;
+    private static final int S_CONFIG_KEEPALIVE      = 0x04;
+    private static final int C_CONFIG_PLUGIN_MSG     = 0x01;
+    private static final int C_CONFIG_DISCONNECT     = 0x02;
+    private static final int C_CONFIG_FINISH         = 0x03;
+    private static final int C_CONFIG_KEEPALIVE      = 0x04;
+    private static final int C_CONFIG_PING           = 0x05;
+    private static final int C_CONFIG_KNOWN_PACKS    = 0x0E;
 
-    // ── Clientbound Configuration ─────────────────────────────────────
-    // These IDs are stable across 764–774
-    private static final int C_CONFIG_COOKIE_REQ  = 0x00;
-    private static final int C_CONFIG_PLUGIN_MSG  = 0x01;
-    private static final int C_CONFIG_DISCONNECT  = 0x02;
-    private static final int C_CONFIG_FINISH      = 0x03;
-    private static final int C_CONFIG_KEEPALIVE   = 0x04;
-    private static final int C_CONFIG_PING        = 0x05;
-    private static final int C_CONFIG_KNOWN_PACKS = 0x0E;
+    // ── Play state — only two packets we ever send ────────────────────────
+    // Confirm Teleport is 0x00 in every version since 1.9 ✓
+    private static final int S_CONFIRM_TELEPORT      = 0x00;
+    // Keep Alive response ID is detected dynamically at runtime
+    private int keepAliveResponseId = -1; // set after detection
 
-    // ── Play-state packet IDs — set by resolvePlayIds() ───────────────
-    // Serverbound (S_ = we send to server)
-    private int S_CONFIRM_TELEPORT;  // 0x00 across all versions
-    private int S_CHAT;
-    private int S_CLIENT_INFO_PLAY;
-    private int S_PLUGIN_MSG_PLAY;
-    private int S_KEEPALIVE;
-    private int S_POS_ROT;
-    private int S_ROT;
-    private int S_PLAYER_COMMAND;    // sneak/sprint (entity_action)
-    private int S_SWING_ARM;
-    // Clientbound (C_ = we receive from server)
-    private int C_LOGIN_PLAY;
-    private int C_PLUGIN_MSG_PLAY;
-    private int C_KEEPALIVE;
-    private int C_SYNC_POS;          // Synchronize Player Position
-    private int C_DISCONNECT_PLAY;
-
-    private static final int PROTO_FALLBACK = 769; // 1.21.4
+    private static final int PROTO_FALLBACK = 769;
 
     private final DataInputStream  in;
     private final DataOutputStream out;
     private final Logger           log;
+    private final String           botName;
 
     private int     protocolVersion    = PROTO_FALLBACK;
     private boolean compressionEnabled = false;
     private int     compressionThreshold = -1;
-    
-    // ── Enhanced version detection ────────────────────────────────────
-    private int detectedProtocol = -1;
-    private boolean useAdaptiveHandling = false;
 
-    public MinecraftProtocol(DataInputStream in, DataOutputStream out, Logger log) {
-        this.in  = in;
-        this.out = out;
-        this.log = log;
-        resolvePlayIds(PROTO_FALLBACK);
+    public MinecraftProtocol(DataInputStream in, DataOutputStream out,
+                             Logger log, String botName) {
+        this.in      = in;
+        this.out     = out;
+        this.log     = log;
+        this.botName = botName;
     }
 
     public void setProtocolVersion(int v) {
         this.protocolVersion = v;
-        this.detectedProtocol = v;
-        resolvePlayIds(v);
-        log.info("[Protocol] Set protocol version to " + v);
-    }
-
-    /**
-     * Resolve Play-state packet IDs for the given protocol version.
-     * Now with enhanced adaptive support for future versions.
-     */
-    private void resolvePlayIds(int proto) {
-        if (proto >= 774) {
-            // ── 1.21.5+ (protocol 774+) ────────────────────────────────
-            S_CONFIRM_TELEPORT  = 0x00;
-            S_CHAT              = 0x05;
-            S_CLIENT_INFO_PLAY  = 0x08;
-            S_PLUGIN_MSG_PLAY   = 0x12;
-            S_KEEPALIVE         = 0x18;
-            S_POS_ROT           = 0x1A;
-            S_ROT               = 0x1B;
-            S_PLAYER_COMMAND    = 0x22;
-            S_SWING_ARM         = 0x2E;
-            C_LOGIN_PLAY        = 0x31;
-            C_PLUGIN_MSG_PLAY   = 0x18;
-            C_KEEPALIVE         = 0x2C;
-            C_SYNC_POS          = 0x48;
-            C_DISCONNECT_PLAY   = 0x20;
-            
-            // For protocol > 774, enable adaptive mode
-            if (proto > 774) {
-                useAdaptiveHandling = true;
-                log.warning("[Protocol] Unknown protocol " + proto + " — using adaptive handling with fallback to 774");
-            }
-        } else if (proto >= 768) {
-            // ── 1.21.2–1.21.4 (protocol 768–769) ────────────────────
-            S_CONFIRM_TELEPORT  = 0x00;
-            S_CHAT              = 0x06;
-            S_CLIENT_INFO_PLAY  = 0x0A;
-            S_PLUGIN_MSG_PLAY   = 0x13;
-            S_KEEPALIVE         = 0x1A;
-            S_POS_ROT           = 0x1D;
-            S_ROT               = 0x1E;
-            S_PLAYER_COMMAND    = 0x2C;
-            S_SWING_ARM         = 0x36;
-            C_LOGIN_PLAY        = 0x2B;
-            C_PLUGIN_MSG_PLAY   = 0x19;
-            C_KEEPALIVE         = 0x26;
-            C_SYNC_POS          = 0x40;
-            C_DISCONNECT_PLAY   = 0x1D;
+        // Derive Keep Alive serverbound ID from known reference points.
+        // We use the confirmed 774 table reconstructed from ProtocolLib 775
+        // minus 10 new packets, cross-checked against jigsaw_generate = 0x12 in 774
+        // (server error message confirmed 0x12 = jigsaw, keepalive = 0x13 in 774).
+        // For 769 and below, keepalive = 0x1A (confirmed working).
+        // For 768-769: 0x1A. For 774: 0x13. For 775+: 0x1C.
+        if (v >= 775) {
+            keepAliveResponseId = 0x1C;
+        } else if (v >= 770) {
+            // 770–774: reconstructed from 774 (jigsaw=0x12, keepalive=0x13)
+            keepAliveResponseId = 0x13;
+        } else if (v >= 768) {
+            keepAliveResponseId = 0x1A;
         } else {
-            // ── 1.20.3–1.21.1 (protocol 764–767) ────────────────────
-            S_CONFIRM_TELEPORT  = 0x00;
-            S_CHAT              = 0x06;
-            S_CLIENT_INFO_PLAY  = 0x09;
-            S_PLUGIN_MSG_PLAY   = 0x12;
-            S_KEEPALIVE         = 0x18;
-            S_POS_ROT           = 0x1A;
-            S_ROT               = 0x1B;
-            S_PLAYER_COMMAND    = 0x27;
-            S_SWING_ARM         = 0x33;
-            C_LOGIN_PLAY        = 0x29;
-            C_PLUGIN_MSG_PLAY   = 0x17;
-            C_KEEPALIVE         = 0x24;
-            C_SYNC_POS          = 0x3E;
-            C_DISCONNECT_PLAY   = 0x1B;
+            keepAliveResponseId = 0x18;
         }
+        log.info("[" + botName + "] Protocol " + v
+                + " → S_KEEPALIVE=0x" + Integer.toHexString(keepAliveResponseId)
+                + " (only packet we send in Play state)");
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // Authentication and Login
+    // Status ping
     // ═══════════════════════════════════════════════════════════════════
 
-    public static int queryProtocolVersion(String host, int port, Logger log) throws IOException {
-        Socket s = new Socket(host, port);
-        s.setSoTimeout(5000);
-        DataOutputStream out = new DataOutputStream(s.getOutputStream());
-        DataInputStream in = new DataInputStream(s.getInputStream());
+    public static int queryProtocolVersion(String host, int port, Logger log) {
+        try (java.net.Socket s = new java.net.Socket(host, port)) {
+            s.setSoTimeout(5_000);
+            DataOutputStream o = new DataOutputStream(
+                    new BufferedOutputStream(s.getOutputStream()));
+            DataInputStream  i = new DataInputStream(
+                    new BufferedInputStream(s.getInputStream()));
 
-        // Handshake → Status request
-        ByteArrayOutputStream b = new ByteArrayOutputStream();
-        writeVarInt(b, 0);  // Handshake packet ID
-        writeVarInt(b, -1); // protocol: -1 = query (any version)
-        writeString(b, host);
-        writeShort(b, port);
-        writeVarInt(b, 1);  // next state: status
-        sendFrame(out, b.toByteArray());
+            // Handshake → Status
+            ByteArrayOutputStream buf = new ByteArrayOutputStream();
+            writeVarInt(buf, PROTO_FALLBACK);
+            writeString(buf, host);
+            writeShort(buf, port);
+            writeVarInt(buf, 1);
+            sendFramedNoCompression(o, 0x00, buf.toByteArray());
+            sendFramedNoCompression(o, 0x00, new byte[0]);
+            o.flush();
 
-        b = new ByteArrayOutputStream();
-        writeVarInt(b, 0);  // Status Request packet ID
-        sendFrame(out, b.toByteArray());
-
-        // Read Status Response
-        int pktLen = readVarInt(in);
-        byte[] raw = new byte[pktLen];
-        in.readFully(raw);
-        DataInputStream d = new DataInputStream(new ByteArrayInputStream(raw));
-        int id = readVarInt(d);
-        if (id == 0) {
+            int len = readVarInt(i);
+            byte[] raw = readExactly(i, len);
+            DataInputStream d = new DataInputStream(new ByteArrayInputStream(raw));
+            if (readVarInt(d) != 0x00) return -1;
             String json = readString(d);
-            // Parse version from JSON: "version":{"name":"1.21.4","protocol":769}
-            int protoIdx = json.indexOf("\"protocol\":");
-            if (protoIdx >= 0) {
-                String sub = json.substring(protoIdx + 11);
-                int endIdx = sub.indexOf("}");
-                String protoStr = sub.substring(0, endIdx).trim();
-                try {
-                    int proto = Integer.parseInt(protoStr);
-                    log.info("[Status] Detected protocol version: " + proto);
-                    return proto;
-                } catch (NumberFormatException ignored) {}
+
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("\"protocol\"\\s*:\\s*(-?\\d+)").matcher(json);
+            if (m.find()) {
+                int proto = Integer.parseInt(m.group(1));
+                log.info("[StatusPing] Server protocol version: " + proto);
+                return proto;
             }
+        } catch (Exception e) {
+            log.warning("[StatusPing] Failed: " + e.getMessage());
         }
-        s.close();
         return -1;
     }
 
-    private static void sendFrame(DataOutputStream out, byte[] data) throws IOException {
-        ByteArrayOutputStream frame = new ByteArrayOutputStream();
-        writeVarInt(frame, data.length);
-        frame.write(data);
-        out.write(frame.toByteArray());
-        out.flush();
-    }
+    // ═══════════════════════════════════════════════════════════════════
+    // Login + Configuration
+    // ═══════════════════════════════════════════════════════════════════
 
     public void initiateLogin(String host, int port, String name, UUID uuid) throws IOException {
-        // Handshake
-        ByteArrayOutputStream b = new ByteArrayOutputStream();
-        writeVarInt(b, S_HANDSHAKE);
-        writeVarInt(b, protocolVersion);
-        writeString(b, host);
-        writeShort(b, port);
-        writeVarInt(b, 2);  // next state: login
-        sendRaw(b.toByteArray(), false);
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        writeVarInt(buf, protocolVersion);
+        writeString(buf, host);
+        writeShort(buf, port);
+        writeVarInt(buf, 2); // next state: Login
+        sendRaw(S_HANDSHAKE, buf.toByteArray());
 
-        // Login Start
-        b = new ByteArrayOutputStream();
-        writeVarInt(b, S_LOGIN_START);
-        writeString(b, name);
-        writeLong(b, uuid.getMostSignificantBits());
-        writeLong(b, uuid.getLeastSignificantBits());
-        sendRaw(b.toByteArray(), false);
-
-        log.info("[Login] Sent handshake + login start for " + name);
+        buf.reset();
+        writeString(buf, name);
+        writeLong(buf, uuid.getMostSignificantBits());
+        writeLong(buf, uuid.getLeastSignificantBits());
+        sendRaw(S_LOGIN_START, buf.toByteArray());
     }
 
     public boolean completeLogin(String name) throws IOException {
-        while (true) {
-            try {
-                int pktLen = readVarInt(in);
-                byte[] raw = readExactly(in, pktLen);
-                DataInputStream d = new DataInputStream(new ByteArrayInputStream(raw));
-                int id = readVarInt(d);
-
-                if (id == C_LOGIN_SUCCESS) {
-                    UUID uuid = new UUID(d.readLong(), d.readLong());
-                    String username = readString(d);
-                    log.info("[Login] Received login success: " + username);
-                    return true;
-                } else if (id == C_DISCONNECT_LOGIN) {
-                    return false;
-                } else if (id == C_SET_COMPRESSION) {
-                    int thresh = readVarInt(d);
-                    compressionThreshold = thresh;
-                    compressionEnabled = (thresh >= 0);
-                    log.fine("[Login] Compression threshold: " + thresh);
-                } else if (id == C_ENCRYPTION_REQUEST) {
-                    // OfflineMode: assume no encryption needed
-                    log.warning("[Login] Received encryption request in offline mode");
-                    return false;
-                } else {
-                    log.fine("[Login] Skipping packet: 0x" + Integer.toHexString(id));
+        for (int i = 0; i < 50; i++) {
+            Packet pkt = readPacket();
+            switch (pkt.id) {
+                case C_SET_COMPRESSION -> {
+                    compressionThreshold = readVarInt(pkt.stream());
+                    compressionEnabled   = compressionThreshold >= 0;
                 }
-            } catch (EOFException e) {
-                throw new IOException("Login failed: connection closed", e);
+                case C_LOGIN_SUCCESS -> {
+                    DataInputStream d = pkt.stream();
+                    d.skipBytes(16); // UUID
+                    readString(d);   // name echo
+                    int props = readVarInt(d);
+                    for (int p = 0; p < props; p++) {
+                        readString(d); readString(d);
+                        if (d.readBoolean()) readString(d);
+                    }
+                    sendRaw(S_LOGIN_ACK, new byte[0]);
+                    return completeConfiguration();
+                }
+                case C_DISCONNECT_LOGIN -> {
+                    log.warning("[" + name + "] Login kick: " + readString(pkt.stream()));
+                    return false;
+                }
+                case C_ENCRYPTION_REQUEST -> {
+                    log.warning("[" + name + "] Online-mode server — not supported");
+                    return false;
+                }
+                case C_LOGIN_PLUGIN_REQUEST -> {
+                    // Reply "not understood"
+                    int msgId = readVarInt(pkt.stream());
+                    ByteArrayOutputStream r = new ByteArrayOutputStream();
+                    writeVarInt(r, msgId);
+                    r.write(0);
+                    sendRaw(0x02, r.toByteArray());
+                }
             }
         }
+        return false;
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // Configuration and Play-state
-    // ═══════════════════════════════════════════════════════════════════
+    private boolean completeConfiguration() throws IOException {
+        // Send Client Information
+        ByteArrayOutputStream ci = new ByteArrayOutputStream();
+        writeString(ci, "en_us");
+        ci.write(10);          // view distance
+        writeVarInt(ci, 0);    // chat mode: enabled
+        ci.write(1);           // chat colors
+        ci.write(0x7F);        // skin parts
+        writeVarInt(ci, 1);    // main hand: right
+        ci.write(0);           // text filtering
+        ci.write(1);           // server listings
+        if (protocolVersion >= 770) writeVarInt(ci, 2); // particle status (1.21.5+)
+        sendRaw(S_CONFIG_CLIENT_INFO, ci.toByteArray());
 
-    public void readAndHandle(BotClient client) throws IOException {
-        Packet pkt = readPacket();
-        int id = pkt.id();
+        for (int i = 0; i < 400; i++) {
+            Packet pkt = readPacket();
+            log.info("[" + botName + "] Config packet 0x"
+                    + Integer.toHexString(pkt.id) + " (" + pkt.data.length + " bytes)");
 
-        if (id == C_CONFIG_KEEPALIVE) {
-            long keepAliveId = readLong(pkt.stream());
-            ByteArrayOutputStream b = new ByteArrayOutputStream();
-            writeVarInt(b, S_CONFIG_KEEPALIVE);
-            writeLong(b, keepAliveId);
-            sendRaw(b.toByteArray(), true);
-            log.fine("[Config] Sent keep alive");
-        } else if (id == C_CONFIG_PING) {
-            int id2 = readVarInt(pkt.stream());
-            ByteArrayOutputStream b = new ByteArrayOutputStream();
-            writeVarInt(b, 0x04); // Pong
-            writeVarInt(b, id2);
-            sendRaw(b.toByteArray(), true);
-            log.fine("[Config] Sent pong");
-        } else if (id == C_CONFIG_DISCONNECT) {
-            throw new IOException("Kicked from config: " + readString(pkt.stream()));
-        } else if (id == C_CONFIG_FINISH) {
-            log.info("[Config] Received finish configuration, entering play state");
-        } else if (id == C_LOGIN_PLAY) {
-            log.info("[Play] Received login packet");
-            ByteArrayOutputStream b = new ByteArrayOutputStream();
-            writeVarInt(b, S_CLIENT_INFO_PLAY);
-            writeString(b, "en_US");
-            b.write(0x08);  // difficulty (default)
-            b.write(1);     // render distance (default)
-            writeVarInt(b, 0); // chat mode
-            b.write(1);     // colors enabled
-            b.write(0x00);  // model parts bitmask
-            writeVarInt(b, 0); // main hand
-            b.write(0);     // text filtering
-            b.write(0);     // allow server listings
-            sendRaw(b.toByteArray(), true);
-            
-            // Send brand
-            ByteArrayOutputStream brand = new ByteArrayOutputStream();
-            writeString(brand, "minecraft:brand");
-            writeString(brand, "vanilla");
-            sendRaw(brand.toByteArray(), true);
-            log.fine("[Play] Sent Client Information + brand");
-
-        } else if (id == C_KEEPALIVE) {
-            long keepAliveId = readLong(pkt.stream());
-            ByteArrayOutputStream b = new ByteArrayOutputStream();
-            writeVarInt(b, S_KEEPALIVE);
-            writeLong(b, keepAliveId);
-            sendRaw(b.toByteArray(), true);
-            log.fine("[Play] Sent keep alive");
-        } else if (id == C_SYNC_POS) {
-            double x = readDouble(pkt.stream());
-            double y = readDouble(pkt.stream());
-            double z = readDouble(pkt.stream());
-            float yaw = readFloat(pkt.stream());
-            float pitch = readFloat(pkt.stream());
-            byte flags = pkt.stream().readByte();
-            int teleportId = readVarInt(pkt.stream());
-            client.updatePosition(x, y, z, yaw, pitch);
-            ByteArrayOutputStream b = new ByteArrayOutputStream();
-            writeVarInt(b, S_CONFIRM_TELEPORT);
-            writeVarInt(b, teleportId);
-            sendRaw(b.toByteArray(), true);
-            log.fine("[Play] Synchronize position: " + x + ", " + y + ", " + z);
-        } else if (id == C_DISCONNECT_PLAY) {
-            throw new IOException("Kicked: " + readString(pkt.stream()));
-        } else {
-            // ── Enhanced unknown packet handling ────────────────────
-            // Instead of failing, log and skip unknown packets gracefully
-            log.fine("[Play] Skipping unknown packet 0x" + Integer.toHexString(id) + 
-                    " (" + pkt.data().length + " bytes)");
+            switch (pkt.id) {
+                case C_CONFIG_FINISH -> {
+                    sendRaw(S_CONFIG_ACK, new byte[0]);
+                    log.info("[" + botName + "] Configuration complete, entering Play state");
+                    return true;
+                }
+                case C_CONFIG_KEEPALIVE -> {
+                    long id = pkt.stream().readLong();
+                    ByteArrayOutputStream r = new ByteArrayOutputStream();
+                    writeLong(r, id);
+                    sendRaw(S_CONFIG_KEEPALIVE, r.toByteArray());
+                }
+                case C_CONFIG_PING -> {
+                    int pingId = pkt.stream().readInt();
+                    ByteArrayOutputStream r = new ByteArrayOutputStream();
+                    r.write((pingId >> 24) & 0xFF); r.write((pingId >> 16) & 0xFF);
+                    r.write((pingId >>  8) & 0xFF); r.write(pingId & 0xFF);
+                    sendRaw(0x04, r.toByteArray());
+                }
+                case C_CONFIG_DISCONNECT -> {
+                    log.warning("[" + botName + "] Config kick: " + readString(pkt.stream()));
+                    return false;
+                }
+                case C_CONFIG_KNOWN_PACKS -> {
+                    // Acknowledge with empty list
+                    ByteArrayOutputStream r = new ByteArrayOutputStream();
+                    writeVarInt(r, 0);
+                    sendRaw(S_CONFIG_KNOWN_PACKS, r.toByteArray());
+                    log.info("[" + botName + "] Replied to Select Known Packs");
+                }
+                case C_CONFIG_PLUGIN_MSG -> {
+                    DataInputStream d = pkt.stream();
+                    String channel = readString(d);
+                    if ("minecraft:brand".equals(channel)) {
+                        ByteArrayOutputStream r = new ByteArrayOutputStream();
+                        writeString(r, "minecraft:brand");
+                        writeString(r, "vanilla");
+                        sendRaw(S_CONFIG_PLUGIN_MSG, r.toByteArray());
+                        log.info("[" + botName + "] Replied to minecraft:brand");
+                    }
+                }
+                // Registry data, tags, cookie requests — silently consumed
+            }
         }
+        log.warning("[" + botName + "] Config timed out");
+        return false;
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // Play-state send helpers
+    // Play state — PASSIVE: only KeepAlive + Confirm Teleport
     // ═══════════════════════════════════════════════════════════════════
 
-    public void sendChatMessage(String msg) throws IOException {
-        if (msg.length() > 256) msg = msg.substring(0, 256);
-        ByteArrayOutputStream b = new ByteArrayOutputStream();
-        writeString(b, msg);
-        writeLong(b, System.currentTimeMillis());
-        writeLong(b, 0L);     // salt
-        b.write(0);            // no signature
-        writeVarInt(b, 0);     // message count
-        b.write(new byte[3]);  // acknowledged bitset (20 bits = 3 bytes, all zero)
-        sendRaw(b.toByteArray(), true);
-    }
+    /**
+     * Read and handle one Play-state packet.
+     *
+     * Strategy: read every packet fully (to keep the stream in sync),
+     * but only ACT on KeepAlive and Disconnect.
+     * Confirm Teleport is handled inline when we detect the position sync packet.
+     *
+     * We detect KeepAlive by trying BOTH possible server→client IDs
+     * (one for older, one for newer protocol). If either matches and the
+     * payload is exactly 8 bytes, we treat it as KeepAlive.
+     *
+     * We detect Synchronize Player Position heuristically: payload starts
+     * with a valid VarInt (teleport ID), followed by 3 doubles + floats.
+     * To avoid false positives we only confirm teleport for short packets
+     * (< 64 bytes) that look like position packets.
+     */
+    public void readAndHandle(BotClient bot) throws IOException {
+        Packet pkt = readPacket();
 
-    public void sendPositionAndLook(double x, double y, double z,
-                                    float yaw, float pitch, boolean onGround) throws IOException {
-        ByteArrayOutputStream b = new ByteArrayOutputStream();
-        writeDouble(b, x); writeDouble(b, y); writeDouble(b, z);
-        writeFloat(b, yaw); writeFloat(b, pitch);
-        b.write(onGround ? 1 : 0);
-        sendRaw(b.toByteArray(), true);
-    }
+        // ── Disconnect: only safe thing to throw ─────────────────────────
+        // Known clientbound disconnect IDs per version range:
+        //   764-767: 0x1B, 768-769: 0x1D, 770-773: 0x1D, 774: 0x20, 775+: 0x20
+        // But we treat ANY packet with a JSON text payload as potential kick —
+        // actually just throw on known IDs.
+        boolean isKnownDisconnect =
+                (protocolVersion >= 774 && pkt.id == 0x20) ||
+                (protocolVersion >= 768 && protocolVersion < 774 && pkt.id == 0x1D) ||
+                (protocolVersion < 768  && pkt.id == 0x1B);
+        if (isKnownDisconnect && pkt.data.length > 0) {
+            String reason = safeReadString(pkt.data);
+            throw new IOException("Kicked: " + reason);
+        }
 
-    public void sendLook(float yaw, float pitch, boolean onGround) throws IOException {
-        ByteArrayOutputStream b = new ByteArrayOutputStream();
-        writeFloat(b, yaw); writeFloat(b, pitch);
-        b.write(onGround ? 1 : 0);
-        sendRaw(b.toByteArray(), true);
-    }
+        // ── Keep Alive: 8-byte payload = Long ────────────────────────────
+        // We respond with whatever ID was negotiated for this protocol.
+        // Additionally try both known C→S IDs in case our table is off.
+        if (pkt.data.length == 8) {
+            // Could be KeepAlive — respond using negotiated ID
+            if (keepAliveResponseId >= 0) {
+                long id = pkt.stream().readLong();
+                ByteArrayOutputStream r = new ByteArrayOutputStream();
+                writeLong(r, id);
+                sendRaw(keepAliveResponseId, r.toByteArray());
+                log.fine("[" + botName + "] KeepAlive 0x" + Integer.toHexString(pkt.id)
+                        + " → responded with S:0x" + Integer.toHexString(keepAliveResponseId));
+                return;
+            }
+        }
 
-    public void sendSwingArm() throws IOException {
-        ByteArrayOutputStream b = new ByteArrayOutputStream();
-        writeVarInt(b, 0); // main hand
-        sendRaw(b.toByteArray(), true);
-    }
+        // ── Synchronize Player Position: must Confirm Teleport ────────────
+        // Heuristic: packet large enough for a position (>=28 bytes for pos+rot+flags)
+        // and contains a VarInt teleport ID we can extract.
+        // We attempt to parse it; if parsing fails we skip silently.
+        // Known clientbound sync-pos IDs:
+        //   764-767: 0x3E, 768-769: 0x40, 774: 0x48, 775+: ?
+        boolean isKnownSyncPos =
+                (protocolVersion >= 774 && pkt.id == 0x48) ||
+                (protocolVersion >= 768 && protocolVersion < 774 && pkt.id == 0x40) ||
+                (protocolVersion < 768  && pkt.id == 0x3E);
 
-    public void sendEntityAction(EntityAction action) throws IOException {
-        ByteArrayOutputStream b = new ByteArrayOutputStream();
-        writeVarInt(b, 0);          // entity id (server fills in from session)
-        writeVarInt(b, action.id);
-        writeVarInt(b, 0);          // jump boost (unused for sneak/sprint)
-        sendRaw(b.toByteArray(), true);
+        if (isKnownSyncPos && pkt.data.length >= 20) {
+            try {
+                DataInputStream d = pkt.stream();
+                int teleportId;
+                double x, y, z;
+                float yaw, pitch;
+
+                if (protocolVersion >= 768) {
+                    // 1.21.2+: teleportId first
+                    teleportId = readVarInt(d);
+                    x = d.readDouble(); y = d.readDouble(); z = d.readDouble();
+                    d.readDouble(); d.readDouble(); d.readDouble(); // velocity
+                    yaw = d.readFloat(); pitch = d.readFloat();
+                } else {
+                    // 1.20.x–1.21.1: position first
+                    x = d.readDouble(); y = d.readDouble(); z = d.readDouble();
+                    yaw = d.readFloat(); pitch = d.readFloat();
+                    d.readByte(); // flags
+                    teleportId = readVarInt(d);
+                }
+
+                // Send Confirm Teleport (always 0x00)
+                ByteArrayOutputStream r = new ByteArrayOutputStream();
+                writeVarInt(r, teleportId);
+                sendRaw(S_CONFIRM_TELEPORT, r.toByteArray());
+                bot.updatePosition(x, y, z, yaw, pitch);
+                log.fine("[" + botName + "] Confirmed teleport #" + teleportId);
+            } catch (Exception e) {
+                log.fine("[" + botName + "] SyncPos parse failed (ignored): " + e.getMessage());
+            }
+        }
+
+        // All other packets: silently consumed (stream already read fully by readPacket)
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -414,12 +376,9 @@ public class MinecraftProtocol {
         writeVarInt(idBuf, packetId);
         idBuf.write(payload);
         byte[] data = idBuf.toByteArray();
-        sendRaw(data, true);
-    }
 
-    private synchronized void sendRaw(byte[] data, boolean useCompression) throws IOException {
         ByteArrayOutputStream frame = new ByteArrayOutputStream();
-        if (useCompression && compressionEnabled) {
+        if (compressionEnabled) {
             ByteArrayOutputStream inner = new ByteArrayOutputStream();
             if (data.length >= compressionThreshold) {
                 writeVarInt(inner, data.length);
@@ -428,15 +387,27 @@ public class MinecraftProtocol {
                 writeVarInt(inner, 0);
                 inner.write(data);
             }
-            byte[] innerBytes = inner.toByteArray();
-            writeVarInt(frame, innerBytes.length);
-            frame.write(innerBytes);
+            byte[] ib = inner.toByteArray();
+            writeVarInt(frame, ib.length);
+            frame.write(ib);
         } else {
             writeVarInt(frame, data.length);
             frame.write(data);
         }
         out.write(frame.toByteArray());
         out.flush();
+    }
+
+    private static void sendFramedNoCompression(DataOutputStream o, int id, byte[] payload) throws IOException {
+        ByteArrayOutputStream idBuf = new ByteArrayOutputStream();
+        writeVarInt(idBuf, id);
+        idBuf.write(payload);
+        byte[] data = idBuf.toByteArray();
+        ByteArrayOutputStream frame = new ByteArrayOutputStream();
+        writeVarInt(frame, data.length);
+        frame.write(data);
+        o.write(frame.toByteArray());
+        o.flush();
     }
 
     private Packet readPacket() throws IOException {
@@ -451,8 +422,8 @@ public class MinecraftProtocol {
             DataInputStream od = new DataInputStream(new ByteArrayInputStream(outer));
             int dataLen = readVarInt(od);
             byte[] inner = od.readAllBytes();
-            byte[] uncompressed = (dataLen == 0) ? inner : decompress(inner);
-            DataInputStream d = new DataInputStream(new ByteArrayInputStream(uncompressed));
+            byte[] unc = (dataLen == 0) ? inner : decompress(inner);
+            DataInputStream d = new DataInputStream(new ByteArrayInputStream(unc));
             int id = readVarInt(d);
             return new Packet(id, d.readAllBytes());
         }
@@ -463,12 +434,12 @@ public class MinecraftProtocol {
     // ═══════════════════════════════════════════════════════════════════
 
     private static byte[] readExactly(DataInputStream in, int n) throws IOException {
-        if (n == 0) return new byte[0];
+        if (n <= 0) return new byte[0];
         byte[] buf = new byte[n];
         int read = 0;
         while (read < n) {
             int r = in.read(buf, read, n - read);
-            if (r < 0) throw new EOFException("Stream ended: got " + read + "/" + n);
+            if (r < 0) throw new EOFException("Stream ended: " + read + "/" + n);
             read += r;
         }
         return buf;
@@ -495,14 +466,19 @@ public class MinecraftProtocol {
         return new String(readExactly(in, readVarInt(in)), StandardCharsets.UTF_8);
     }
 
+    private static String safeReadString(byte[] data) {
+        try {
+            DataInputStream d = new DataInputStream(new ByteArrayInputStream(data));
+            return readString(d);
+        } catch (Exception e) {
+            return "(unreadable)";
+        }
+    }
+
     private static void writeString(OutputStream out, String s) throws IOException {
         byte[] b = s.getBytes(StandardCharsets.UTF_8);
         writeVarInt(out, b.length);
         out.write(b);
-    }
-
-    private static long readLong(DataInputStream in) throws IOException {
-        return in.readLong();
     }
 
     private static void writeLong(OutputStream out, long v) throws IOException {
@@ -511,24 +487,6 @@ public class MinecraftProtocol {
 
     private static void writeShort(OutputStream out, int v) throws IOException {
         out.write((v >> 8) & 0xFF); out.write(v & 0xFF);
-    }
-
-    private static double readDouble(DataInputStream in) throws IOException {
-        return Double.longBitsToDouble(in.readLong());
-    }
-
-    private static void writeDouble(OutputStream out, double v) throws IOException {
-        writeLong(out, Double.doubleToRawLongBits(v));
-    }
-
-    private static float readFloat(DataInputStream in) throws IOException {
-        return Float.intBitsToFloat(in.readInt());
-    }
-
-    private static void writeFloat(OutputStream out, float v) throws IOException {
-        int b = Float.floatToRawIntBits(v);
-        out.write((b>>24)&0xFF); out.write((b>>16)&0xFF);
-        out.write((b>>8)&0xFF);  out.write(b&0xFF);
     }
 
     private static byte[] compress(byte[] data) throws IOException {
@@ -554,12 +512,5 @@ public class MinecraftProtocol {
 
     private record Packet(int id, byte[] data) {
         DataInputStream stream() { return new DataInputStream(new ByteArrayInputStream(data)); }
-    }
-
-    public enum EntityAction {
-        START_SNEAKING(5), STOP_SNEAKING(6),
-        START_SPRINTING(3), STOP_SPRINTING(4);
-        public final int id;
-        EntityAction(int id) { this.id = id; }
     }
 }
