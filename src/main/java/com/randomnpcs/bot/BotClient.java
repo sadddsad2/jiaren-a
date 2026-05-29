@@ -139,7 +139,7 @@ public class BotClient {
                 String msg = e.getMessage() != null ? e.getMessage() : "";
 
                 if (msg.startsWith("Kicked:")) {
-                    plugin.getLogger().info(name + " left the game");
+                    // Paper already logs the quit message natively
 
                 } else if (isProbeDecodeError(msg)) {
                     int nextId = proto.nextProbeCandidate();
@@ -149,7 +149,7 @@ public class BotClient {
                     probeFailedReconnect = true;
 
                 } else {
-                    plugin.getLogger().info(name + " left the game");
+                    // Paper already logs the quit message natively
                 }
             } finally {
                 handleDisconnect();
@@ -211,7 +211,6 @@ public class BotClient {
             Player p = Bukkit.getPlayerExact(name);
             if (p != null && p.isOnline()) {
                 p.chat(finalMsg);
-                plugin.getLogger().info("<" + name + "> " + finalMsg);
             }
         });
     }
