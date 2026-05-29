@@ -11,11 +11,40 @@ import java.util.logging.Logger;
 /**
  * Minimal Minecraft protocol client — fully adaptive Play-state packet detection.
  *
- * ALL IDs (clientbound KeepAlive, serverbound KeepAlive, SyncPos) are discovered
- * via sniff + probe on the FIRST connection to a server. No hardcoded tables.
+ * ══════════════════════════════════════════════════════════════════════
+ * Design philosophy — "passive bot":
+ *   The TCP connection handles ONLY:
+ *     1. Handshake → Login → Configuration
+ *     2. TeleportConfirm (always 0x00, stable since 1.9)
+ *     3. KeepAlive echo (IDs auto-detected)
+ *   All gameplay actions are handled server-side via the Paper API.
  *
- * Once detected, IDs are written to SERVER_ID_CACHE. Every subsequent bot instance
- * loads the cache and skips sniffing entirely.
+ * ══════════════════════════════════════════════════════════════════════
+ * KeepAlive ID resolution — three-tier strategy (detect once, reuse forever):
+ *
+ *   SERVER_ID_CACHE stores int[]{cbKeepAlive, sbKeepAlive, syncPos} per server.
+ *   Once all three IDs are known the entry is written and every subsequent bot
+ *   instance loads it in the constructor, sets idsResolved = true immediately,
+ *   and never enters the sniff/probe loop at all.
+ *
+ *   Tier 1 — Protocol table (instant, zero reconnects):
+ *     Known triplets for common protocol versions are seeded at construction.
+ *     For protocol 774 (1.21.4): {0x26, 0x18, 0x46}.
+ *
+ *   Tier 2 — Sniff + probe (adaptive, works for any version):
+ *     Step 1: sniff SyncPos packet.
+ *     Step 2: sniff clientbound KeepAlive (first plausible 8-byte packet
+ *             after SyncPos in the expected ID range).
+ *     Step 3: probe serverbound ID by sending the Long with candidate IDs;
+ *             a decode-error disconnect → increment candidate (persisted in
+ *             PROBE_CANDIDATE_CACHE across reconnects) and reconnect.
+ *             A second clientbound KeepAlive arriving without error → confirmed.
+ *     On confirmation all three IDs are written to SERVER_ID_CACHE.
+ *
+ *   Tier 3 — Offset fallback (last resort):
+ *     Only fires when sniffCount >= SNIFF_WINDOW AND no probe is active.
+ *     Uses a version-aware offset rather than the old fixed -0x0C delta.
+ * ══════════════════════════════════════════════════════════════════════
  */
 public class MinecraftProtocol {
 
@@ -43,16 +72,32 @@ public class MinecraftProtocol {
     private static final int C_CONFIG_KNOWN_PACKS  = 0x0E;
 
     // ── Play state ────────────────────────────────────────────────────────
+    // TeleportConfirm is always 0x00 serverbound (stable since 1.9)
     private static final int S_CONFIRM_TELEPORT    = 0x00;
-    private static final int PROBE_ID_MIN          = 0x01;
+
+    // Probe search space for serverbound KeepAlive ID
+    private static final int PROBE_ID_MIN          = 0x01; // skip 0x00 (TeleportConfirm)
     private static final int PROBE_ID_MAX          = 0x7F;
+
+    // Sniff window: raised to 256 so it never fires while a probe is in progress.
+    // A KeepAlive arrives ~20 s after join; on a busy server that's well over 100
+    // packets. 256 gives a comfortable margin.
     private static final int SNIFF_WINDOW          = 256;
+
+    // World-coordinate sanity bounds
     private static final double MAX_COORD          = 3.0e7;
 
     // ── Per-server resolved ID cache (shared across ALL bot instances) ────
+    // Key  : "host:port"
+    // Value: int[]{ clientboundKeepAlive, serverboundKeepAlive, syncPosClientbound }
+    //
+    // Once this entry exists the bot skips sniffing entirely (idsResolved = true
+    // immediately in the constructor).
     private static final java.util.concurrent.ConcurrentHashMap<String, int[]>
             SERVER_ID_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
 
+    // Persists the last probe candidate across reconnects so we never retry
+    // a known-bad ID.
     private static final java.util.concurrent.ConcurrentHashMap<String, Integer>
             PROBE_CANDIDATE_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
 
@@ -61,7 +106,11 @@ public class MinecraftProtocol {
     private int  keepAliveServerboundId = -1;
     private int  syncPosClientboundId   = -1;
     private boolean idsResolved         = false;
+
+    // During probe phase: the KeepAlive Long value we need to echo
     private long pendingKeepAliveId     = 0;
+
+    // The serverbound ID we are currently probing
     private int  probeCandidate         = PROBE_ID_MIN;
 
     private static final int PROTO_FALLBACK = 769;
@@ -86,6 +135,7 @@ public class MinecraftProtocol {
         this.cacheKey = host + ":" + port;
 
         // If all three IDs are already cached, restore them and mark resolved.
+        // The bot skips the sniff/probe loop entirely for this connection.
         int[] cached = SERVER_ID_CACHE.get(cacheKey);
         if (cached != null) {
             keepAliveClientboundId = cached[0];
@@ -95,12 +145,69 @@ public class MinecraftProtocol {
             log.fine("[" + botName + "] IDs from cache — sniff skipped");
         }
 
+        // Resume probe from last known-bad candidate, not from 0x01
         probeCandidate = PROBE_CANDIDATE_CACHE.getOrDefault(cacheKey, PROBE_ID_MIN);
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Protocol ID table — seeds the cache for well-known versions so the
+    // sniff/probe phase is bypassed entirely on first connect.
+    // Called from setProtocolVersion() (before login starts).
+    // ═══════════════════════════════════════════════════════════════════════
+
+    private void seedKnownIds() {
+        if (SERVER_ID_CACHE.containsKey(cacheKey)) return; // already resolved
+
+        int[] ids = knownIdsForProtocol(protocolVersion);
+        if (ids != null) {
+            SERVER_ID_CACHE.put(cacheKey, ids);
+            keepAliveClientboundId = ids[0];
+            keepAliveServerboundId = ids[1];
+            syncPosClientboundId   = ids[2];
+            idsResolved            = true;
+            log.fine("[" + botName + "] Seeded known IDs for protocol " + protocolVersion);
+        }
+    }
+
+    /**
+     * Known {clientbound KeepAlive, serverbound KeepAlive, SyncPos} triplets
+     * for vanilla Paper/Spigot.
+     *
+     *   Protocol 774 = Minecraft 1.21.4
+     *   Protocol 770 = Minecraft 1.21.2 / 1.21.3
+     *   Protocol 769 = Minecraft 1.21.1
+     *   Protocol 767 = Minecraft 1.21 / 1.21.1 (initial release)
+     *   Protocol 765 = Minecraft 1.20.4
+     *   Protocol 764 = Minecraft 1.20.2
+     *   Protocol 763 = Minecraft 1.20 / 1.20.1
+     */
+    private static int[] knownIdsForProtocol(int proto) {
+        if (proto == 774) return new int[]{ 0x26, 0x18, 0x46 }; // 1.21.4
+        if (proto == 770) return new int[]{ 0x26, 0x18, 0x44 }; // 1.21.2/1.21.3
+        if (proto == 769) return new int[]{ 0x26, 0x18, 0x40 }; // 1.21.1
+        if (proto == 767) return new int[]{ 0x24, 0x18, 0x40 }; // 1.21
+        if (proto == 765) return new int[]{ 0x24, 0x18, 0x3E }; // 1.20.4
+        if (proto == 764) return new int[]{ 0x23, 0x18, 0x3C }; // 1.20.2
+        if (proto == 763) return new int[]{ 0x23, 0x17, 0x3A }; // 1.20/1.20.1
+        return null; // unknown version — fall through to sniff/probe
+    }
+
+    /** Reset cached IDs for this server (called when a probed ID turns out wrong). */
+    public void invalidateCache() {
+        SERVER_ID_CACHE.remove(cacheKey);
+        idsResolved            = false;
+        keepAliveServerboundId = -1;
+        syncPosClientboundId   = -1;
+        // keepAliveClientboundId intentionally kept — C ID is already known
+    }
+
+    /** Return the serverbound ID currently being probed (for BotClient to store). */
+    public int getProbeCandidate() { return probeCandidate; }
 
     public void setProtocolVersion(int v) {
         this.protocolVersion = v;
         log.fine("[" + botName + "] Protocol version: " + v);
+        seedKnownIds();
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -269,7 +376,7 @@ public class MinecraftProtocol {
     public void readAndHandle(BotClient bot) throws IOException {
         Packet pkt = readPacket();
 
-        // Disconnect heuristic
+        // Disconnect heuristic: packet in known range with JSON-looking payload
         if (pkt.id >= 0x17 && pkt.id <= 0x30 && pkt.data.length > 2) {
             String reason = safeReadJsonString(pkt.data);
             if (reason != null) throw new IOException("Kicked: " + reason);
@@ -283,7 +390,8 @@ public class MinecraftProtocol {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Sniff phase — fully adaptive, no hardcoded IDs
+    // Sniff phase
+    // (only reached when SERVER_ID_CACHE had no entry on construction)
     // ═══════════════════════════════════════════════════════════════════════
 
     private int sniffCount = 0;
@@ -296,8 +404,7 @@ public class MinecraftProtocol {
             SyncPosResult sp = trySyncPos(pkt);
             if (sp != null) {
                 syncPosClientboundId = pkt.id;
-                log.fine("[" + botName + "] SyncPos detected: 0x"
-                        + Integer.toHexString(pkt.id));
+                log.fine("[" + botName + "] SyncPos detected: 0x" + Integer.toHexString(pkt.id));
                 ByteArrayOutputStream r = new ByteArrayOutputStream();
                 writeVarInt(r, sp.teleportId);
                 sendRaw(S_CONFIRM_TELEPORT, r.toByteArray());
@@ -307,8 +414,9 @@ public class MinecraftProtocol {
         }
 
         // ── Step 2: detect clientbound KeepAlive ──────────────────────────
-        // Auto-detect: accept any packet after SyncPos that is exactly 8 bytes
-        // and whose ID is in the plausible KeepAlive range for this protocol.
+        // Only accept 8-byte packets whose ID falls in the plausible range for
+        // this protocol — prevents set_time and similar 8-byte packets from
+        // being mistaken for KeepAlive.
         if (keepAliveClientboundId == -1
                 && syncPosClientboundId != -1
                 && pkt.data.length == 8
@@ -321,10 +429,13 @@ public class MinecraftProtocol {
                     + Integer.toHexString(keepAliveClientboundId));
 
             if (keepAliveServerboundId >= 0) {
+                // Serverbound ID was already known (e.g. partial cache from a
+                // previous invalidated entry).  Write full cache and resolve.
                 cacheAndResolve();
                 sendKeepAlive(pendingKeepAliveId);
             } else {
                 // Immediately respond with offset-based guess to prevent timeout.
+                // The guess is almost always correct; we confirm on the next KA.
                 int offset = (protocolVersion >= 764) ? 0x0E : 0x0C;
                 int guessedSB = Math.max(1, keepAliveClientboundId - offset);
                 ByteArrayOutputStream kaR = new ByteArrayOutputStream();
@@ -348,6 +459,8 @@ public class MinecraftProtocol {
         }
 
         // ── Step 3: Sniff window exhausted — last-resort fallback ──────────
+        // NEVER fires while a probe is active (keepAliveServerboundId still -1
+        // but keepAliveClientboundId already set).
         if (sniffCount >= SNIFF_WINDOW) {
             if (keepAliveClientboundId >= 0 && keepAliveServerboundId < 0) {
                 // Probe in progress — extend the window, do not clobber IDs
@@ -356,19 +469,15 @@ public class MinecraftProtocol {
 
             if (keepAliveClientboundId < 0) {
                 keepAliveClientboundId = fallbackClientboundKeepAliveId(protocolVersion);
-                log.fine("[" + botName + "] Sniff window exhausted, KA C fallback 0x"
-                        + Integer.toHexString(keepAliveClientboundId));
             }
             if (keepAliveServerboundId < 0) {
                 int offset = (protocolVersion >= 764) ? 0x0E : 0x0C;
                 keepAliveServerboundId = Math.max(1, keepAliveClientboundId - offset);
-                log.fine("[" + botName + "] Sniff window exhausted, KA S fallback 0x"
-                        + Integer.toHexString(keepAliveServerboundId));
+                log.fine("[" + botName + "] Sniff window exhausted, using fallback "
+                        + "S=0x" + Integer.toHexString(keepAliveServerboundId));
             }
             if (syncPosClientboundId < 0) {
                 syncPosClientboundId = fallbackSyncPosId(protocolVersion);
-                log.fine("[" + botName + "] Sniff window exhausted, SyncPos fallback 0x"
-                        + Integer.toHexString(syncPosClientboundId));
             }
             cacheAndResolve();
         }
@@ -383,10 +492,7 @@ public class MinecraftProtocol {
                 new int[]{ keepAliveClientboundId, keepAliveServerboundId, syncPosClientboundId });
         PROBE_CANDIDATE_CACHE.remove(cacheKey);
         idsResolved = true;
-        log.fine("[" + botName + "] IDs resolved and cached — "
-                + "KA_C=0x" + Integer.toHexString(keepAliveClientboundId)
-                + " KA_S=0x" + Integer.toHexString(keepAliveServerboundId)
-                + " SyncPos=0x" + Integer.toHexString(syncPosClientboundId));
+        log.fine("[" + botName + "] IDs resolved and cached");
     }
 
     /**
@@ -394,13 +500,9 @@ public class MinecraftProtocol {
      * other coincidentally-8-byte packets (set_time, etc.) are not misidentified.
      */
     private boolean isPlausibleKeepAliveClientboundId(int id) {
-        // Auto-detect range: widen progressively as protocol version grows.
-        // For truly unknown versions, use a generous window.
         if (protocolVersion >= 770) return id >= 0x22 && id <= 0x2A;
         if (protocolVersion >= 764) return id >= 0x1F && id <= 0x2A;
-        if (protocolVersion >= 760) return id >= 0x1C && id <= 0x28;
-        // Unknown / old version — very generous range
-        return id >= 0x10 && id <= 0x30;
+        return id >= 0x1C && id <= 0x28;
     }
 
     private static int fallbackClientboundKeepAliveId(int proto) {
@@ -435,9 +537,10 @@ public class MinecraftProtocol {
         sendKeepAlive(pendingKeepAliveId);
     }
 
+    /** Second clientbound KeepAlive arrived without a decode error — probe succeeded. */
     private void confirmProbe(long newKeepAliveId) throws IOException {
         keepAliveServerboundId = probeCandidate;
-        cacheAndResolve();
+        cacheAndResolve(); // writes cache, sets idsResolved = true
         pendingKeepAliveId = newKeepAliveId;
         sendKeepAlive(pendingKeepAliveId);
     }
@@ -450,6 +553,8 @@ public class MinecraftProtocol {
         if (pkt.id == keepAliveClientboundId && pkt.data.length == 8) {
             long id = pkt.stream().readLong();
             if (keepAliveServerboundId < 0) {
+                // Still probing (should be rare: only if cache was seeded with
+                // wrong C ID and got invalidated mid-session)
                 confirmProbe(id);
             } else {
                 sendKeepAlive(id);
@@ -468,6 +573,7 @@ public class MinecraftProtocol {
                 log.fine("[" + botName + "] Confirmed teleport #" + sp.teleportId);
             }
         }
+        // Everything else: silently consumed
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -481,6 +587,10 @@ public class MinecraftProtocol {
                 r.toByteArray());
     }
 
+    /**
+     * Advance to the next probe candidate and persist it across reconnects.
+     * @return the new candidate ID
+     */
     public int nextProbeCandidate() {
         probeCandidate++;
         if (probeCandidate == S_CONFIRM_TELEPORT) probeCandidate++;
@@ -500,7 +610,7 @@ public class MinecraftProtocol {
         return (a != null) ? a : trySyncPosLayoutB(pkt);
     }
 
-    /** Layout A (proto >= 768): VarInt teleportId, 3xdouble pos, 3xdouble vel, 2xfloat rot */
+    /** Layout A (proto ≥ 768): VarInt teleportId, 3×double pos, 3×double vel, 2×float rot */
     private SyncPosResult trySyncPosLayoutA(Packet pkt) {
         if (pkt.data.length < 29) return null;
         try {
@@ -515,7 +625,7 @@ public class MinecraftProtocol {
         } catch (Exception e) { return null; }
     }
 
-    /** Layout B (proto < 768): 3xdouble pos, 2xfloat rot, 1xbyte flags, VarInt teleportId */
+    /** Layout B (proto < 768): 3×double pos, 2×float rot, 1×byte flags, VarInt teleportId */
     private SyncPosResult trySyncPosLayoutB(Packet pkt) {
         if (pkt.data.length < 29) return null;
         try {
@@ -565,8 +675,7 @@ public class MinecraftProtocol {
         out.flush();
     }
 
-    private static void sendFramedNoCompression(DataOutputStream o, int id,
-                                                 byte[] payload) throws IOException {
+    private static void sendFramedNoCompression(DataOutputStream o, int id, byte[] payload) throws IOException {
         ByteArrayOutputStream idBuf = new ByteArrayOutputStream();
         writeVarInt(idBuf, id);
         idBuf.write(payload);
@@ -634,6 +743,7 @@ public class MinecraftProtocol {
         return new String(readExactly(in, readVarInt(in)), StandardCharsets.UTF_8);
     }
 
+    /** Parse a JSON text component from raw packet bytes without throwing. */
     private static String safeReadJsonString(byte[] data) {
         try {
             DataInputStream d = new DataInputStream(new ByteArrayInputStream(data));
@@ -681,8 +791,6 @@ public class MinecraftProtocol {
     }
 
     private record Packet(int id, byte[] data) {
-        DataInputStream stream() {
-            return new DataInputStream(new ByteArrayInputStream(data));
-        }
+        DataInputStream stream() { return new DataInputStream(new ByteArrayInputStream(data)); }
     }
 }
