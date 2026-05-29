@@ -8,7 +8,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
 /**
- * 管理假人的生命周期与串行登录队列
+ * Manages all active bot connections and lifecycle with a strict serial login queue.
  */
 public class BotManager {
 
@@ -17,9 +17,11 @@ public class BotManager {
     private final Random random = new Random();
     private int targetBotCount;
     private boolean running = false;
+
+    // Bot name pool tracking (to avoid duplicates)
     private final Set<String> usedNames = new HashSet<>();
 
-    // 串行登录队列
+    // ── Strict Serial Queue Implementation ─────────────────────────────────
     private final Queue<String> loginQueue = new ConcurrentLinkedQueue<>();
     private volatile boolean isLoginProcessing = false;
 
@@ -28,11 +30,11 @@ public class BotManager {
     }
 
     /**
-     * 启动假人管理器，生成目标数量并加入队列
+     * Start bots: pick a random count, populate the serial queue, and process the first one.
      */
     public void startBots() {
         if (running) {
-            plugin.getLogger().warning("BotManager 已经在运行中。");
+            plugin.getLogger().warning("BotManager is already running.");
             return;
         }
         running = true;
@@ -41,7 +43,7 @@ public class BotManager {
         int max = plugin.getConfig().getInt("bot-count-max", 10);
         targetBotCount = min + random.nextInt(max - min + 1);
 
-        plugin.getLogger().info("[队列] 正在准备串行生成 " + targetBotCount + " 个假人...");
+        plugin.getLogger().info("[Queue] Preparing to spawn " + targetBotCount + " bots sequentially...");
 
         for (int i = 0; i < targetBotCount; i++) {
             String name = generateUniqueName();
@@ -49,12 +51,12 @@ public class BotManager {
             loginQueue.add(name);
         }
 
-        // 开始处理队列
+        // Kick off the pipeline
         processNextInQueue();
     }
 
     /**
-     * 提取队列中的下一个假人进行连接
+     * Polls the next name from the queue and initiates connection after a safety delay.
      */
     private synchronized void processNextInQueue() {
         if (!running) {
@@ -64,14 +66,14 @@ public class BotManager {
 
         String nextBotName = loginQueue.poll();
         if (nextBotName == null) {
-            plugin.getLogger().info("[队列] 所有预设的假人已全部成功进入游戏，队列结束。");
+            plugin.getLogger().info("[Queue] All scheduled bots have successfully entered the game. Queue closed.");
             isLoginProcessing = false;
             return;
         }
 
         isLoginProcessing = true;
 
-        // 异步建立连接，给服务器留出 1 秒（20 ticks）的包处理喘息时间
+        // Stagger connections by 20 ticks (1.0s) to let the server process the network handshake completely
         Bukkit.getScheduler().runTaskLaterAsynchronously(plugin, () -> {
             if (!running) return;
             connectSpecificBot(nextBotName);
@@ -79,64 +81,66 @@ public class BotManager {
     }
 
     /**
-     * 连接一个特定的假人
+     * Establishes connection for a designated bot name.
      */
     private void connectSpecificBot(String name) {
         String host = plugin.getServerHost();
         int port = plugin.getServerPort();
 
-        plugin.getLogger().info("[队列] 正在启动假人: " + name + " -> " + host + ":" + port);
+        plugin.getLogger().info("[Queue] Connecting bot: " + name + " -> " + host + ":" + port);
 
         BotClient bot = new BotClient(plugin, this, name, host, port);
         activeBots.put(name, bot);
 
         try {
             bot.connect();
-            // 注意：此处不主动推进队列！必须等待协议线程成功 Verified 之后回调。
+            // Note: We do NOT advance the queue here. We wait for the protocol thread to verify stability.
         } catch (Exception e) {
-            plugin.getLogger().warning("[队列] 假人 " + name + " Socket 连接失败: " + e.getMessage());
+            plugin.getLogger().warning("[Queue] Failed to connect bot " + name + ": " + e.getMessage());
             activeBots.remove(name);
             usedNames.remove(name);
-            // 物理连不上，直接跳过处理下一个
+            
+            // Current bot failed immediately at socket layer, safely leap-frog to the next slot
             processNextInQueue();
         }
     }
 
     /**
-     * 回调：假人完全成功进入游戏（通过探测或直接使用正确记录值通过 Play 认证）
+     * Callback: Triggered when a bot safely receives Play-state packets and locks IDs.
      */
     public void onBotLoginSuccess(String botName) {
-        plugin.getLogger().info("✔ [队列] " + botName + " 已成功登入并稳定运行。放行下一个假人。");
+        plugin.getLogger().info("✔ [Queue] " + botName + " is fully authenticated & stable. Advancing queue.");
         processNextInQueue();
     }
 
     /**
-     * 回调：假人在登录/探测阶段被踢或断开（未完成 Verified）
+     * Callback: Triggered if a bot disconnects before completing the Play-state verification.
      */
     public void onBotLoginFailed(String botName) {
-        plugin.getLogger().warning("❌ [队列] " + botName + " 在登录/探测阶段断开。释放队列槽位。");
+        plugin.getLogger().warning("❌ [Queue] " + botName + " dropped out during sniffing/verification. Releasing slot.");
         activeBots.remove(botName);
         usedNames.remove(botName);
         processNextInQueue();
     }
 
     /**
-     * 停止所有假人
+     * Stop and disconnect all bots.
      */
     public void stopAllBots() {
         running = false;
         loginQueue.clear();
         isLoginProcessing = false;
+        plugin.getLogger().fine("Stopping all " + activeBots.size() + " bots...");
         List<BotClient> toStop = new ArrayList<>(activeBots.values());
         for (BotClient bot : toStop) {
-            bot.disconnect("插件卸载");
+            bot.disconnect("Plugin shutting down");
         }
         activeBots.clear();
         usedNames.clear();
     }
 
     /**
-     * 在游戏内正常存活后死掉或掉线的假人，进行常规重生重试
+     * Called when a verified bot dies in-game — queues up a fresh replacement at the end.
      */
     public void onBotDied(String botName) {
         activeBots.remove(botName);
@@ -144,14 +148,14 @@ public class BotManager {
 
         if (!running) return;
 
-        int respawnDelay = plugin.getConfig().getInt("respawn-delay", 5) * 20;
-        plugin.getLogger().info("假人 " + botName + " 掉线，将在 " + (respawnDelay / 20) + " 秒后重新加入队列排队...");
+        int respawnDelay = plugin.getConfig().getInt("respawn-delay", 5) * 20; // ticks
+        plugin.getLogger().fine("Bot " + botName + " died, appending replacement to queue in " + (respawnDelay / 20) + "s...");
 
         Bukkit.getScheduler().runTaskLaterAsynchronously(plugin, () -> {
             if (!running) return;
             String newName = generateUniqueName();
             usedNames.add(newName);
-            
+
             synchronized (this) {
                 loginQueue.add(newName);
                 if (!isLoginProcessing) {
@@ -162,20 +166,18 @@ public class BotManager {
     }
 
     /**
-     * 探针重连：当前正在负责探测 ID 的假人由于猜测错误被踢
-     * 此时拥有最高优先级：必须立刻插队重连，直到把正确的 ID 探测出来！
+     * Probe reconnect: Fast-track priority. Reuses the same name instantly to increment
+     * and narrow down probe search space without blocking or mixing up other bots.
      */
     public void onBotProbeReconnect(String botName) {
         activeBots.remove(botName);
         if (!running) return;
 
-        plugin.getLogger().info("[探针] " + botName + " 猜测 ID 失败被踢，正在使用更新后的候选值发起即时重连...");
-
+        // 15-tick safety margin to allow server-side connection teardown to settle down
         Bukkit.getScheduler().runTaskLaterAsynchronously(plugin, () -> {
             if (!running) return;
-            // 探针重连复用相同的名字，继续担当开路先锋
             connectSpecificBot(botName);
-        }, 15L); // 错开 0.75 秒后重新建立 Socket
+        }, 15L);
     }
 
     private String generateUniqueName() {
