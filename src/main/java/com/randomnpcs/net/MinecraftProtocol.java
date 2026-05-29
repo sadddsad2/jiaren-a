@@ -1,355 +1,515 @@
 package com.randomnpcs.net;
 
-import com.randomnpcs.RandomBotsPlugin;
 import com.randomnpcs.bot.BotClient;
 
 import java.io.*;
+import java.net.Socket;
 import java.nio.charset.StandardCharsets;
-import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.logging.Logger;
 
 /**
- * 具有自适应 Play 状态 Packet ID 自动探测并共享的 Minecraft 极简协议层
+ * Minimal Minecraft protocol client — fully adaptive Play-state packet detection.
  */
 public class MinecraftProtocol {
 
-    private final RandomBotsPlugin plugin;
-    private final BotClient        bot;
-    private final InputStream      in;
-    private final OutputStream     out;
+    private static final int S_HANDSHAKE           = 0x00;
+    private static final int S_LOGIN_START          = 0x00;
+    private static final int S_LOGIN_ACK            = 0x03;
+    private static final int C_SET_COMPRESSION      = 0x03;
+    private static final int C_LOGIN_SUCCESS        = 0x02;
+    private static final int C_DISCONNECT_LOGIN     = 0x00;
+    private static final int C_ENCRYPTION_REQUEST   = 0x01;
+    private static final int C_LOGIN_PLUGIN_REQUEST = 0x04;
 
-    // ──────────────────────────────────────────────────────────────────────═
-    // 全局静态缓存：[服务器地址 -> int[]{客户端收到的KeepAliveID, 回应的KeepAliveID, 坐标同步ID}]
-    private static final Map<String, int[]> SERVER_ID_CACHE = new ConcurrentHashMap<>();
-    
-    // 全局探测步长记录器，用于在猜测被踢时进行递增累加
-    private static final Map<String, Integer> PROBE_CANDIDATE_CACHE = new ConcurrentHashMap<>();
-    // ──────────────────────────────────────────────────────────────────────═
+    private static final int S_CONFIG_CLIENT_INFO  = 0x00;
+    private static final int S_CONFIG_PLUGIN_MSG   = 0x02;
+    private static final int S_CONFIG_ACK          = 0x03;
+    private static final int S_CONFIG_KNOWN_PACKS  = 0x07;
+    private static final int S_CONFIG_KEEPALIVE    = 0x04;
+    private static final int C_CONFIG_PLUGIN_MSG   = 0x01;
+    private static final int C_CONFIG_DISCONNECT   = 0x02;
+    private static final int C_CONFIG_FINISH       = 0x03;
+    private static final int C_CONFIG_KEEPALIVE    = 0x04;
+    private static final int C_CONFIG_PING         = 0x05;
+    private static final int C_CONFIG_KNOWN_PACKS  = 0x0E;
 
-    private int cbKeepAliveId;
-    private int sbKeepAliveId;
-    private int syncPosId;
-    private boolean idsResolved = false;
+    private static final int S_CONFIRM_TELEPORT    = 0x00;
+    private static final int PROBE_ID_MIN          = 0x01; 
+    private static final int PROBE_ID_MAX          = 0x7F;
+    private static final int SNIFF_WINDOW          = 256;
+    private static final double MAX_COORD          = 3.0e7;
 
-    private int protocolVersion = 767; // 默认 1.20.5+，可在配置加载
-    private int compressionThreshold = -1;
-    private int state = 1; // 1:Handshake, 2:Status, 3:Login, 4:Transfer, 5:Config, 6:Play
+    private static final java.util.concurrent.ConcurrentHashMap<String, int[]> SERVER_ID_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.concurrent.ConcurrentHashMap<String, Integer> PROBE_CANDIDATE_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
 
-    private String cacheKey;
-    private int currentProbeCandidate = 0x00;
+    private int  keepAliveClientboundId = -1;
+    private int  keepAliveServerboundId = -1;
+    private int  syncPosClientboundId   = -1;
+    private boolean idsResolved         = false;
+    private long pendingKeepAliveId     = 0;
+    private int  probeCandidate         = PROBE_ID_MIN;
+
+    private static final int PROTO_FALLBACK = 769;
+
+    private final DataInputStream  in;
+    private final DataOutputStream out;
+    private final Logger           log;
+    private final String           botName;
+    private final String           cacheKey;
+
+    private int     protocolVersion      = PROTO_FALLBACK;
+    private boolean compressionEnabled   = false;
+    private int     compressionThreshold = -1;
     private boolean loginVerifiedTriggered = false;
 
-    public MinecraftProtocol(RandomBotsPlugin plugin, BotClient bot, InputStream in, OutputStream out) {
-        this.plugin = plugin;
-        this.bot    = bot;
-        this.in     = in;
-        this.out    = out;
-    }
-
-    /**
-     * 执行 Handshake -> Login -> Configuration 直至完成
-     */
-    public void loginAndConfig(String host, int port, String name, UUID uuid) throws Exception {
+    public MinecraftProtocol(DataInputStream in, DataOutputStream out, Logger log, String botName, String host, int port) {
+        this.in       = in;
+        this.out      = out;
+        this.log      = log;
+        this.botName  = botName;
         this.cacheKey = host + ":" + port;
-        this.protocolVersion = plugin.getConfig().getInt("protocol-version", 774); // 774 代表 1.21.4
 
-        // 1. 初始化检查全局缓存：如果之前已经探测成功过正确的记录值，直接取出使用！
         int[] cached = SERVER_ID_CACHE.get(cacheKey);
         if (cached != null) {
-            this.cbKeepAliveId = cached[0];
-            this.sbKeepAliveId = cached[1];
-            this.syncPosId     = cached[2];
-            this.idsResolved   = true;
+            keepAliveClientboundId = cached[0];
+            keepAliveServerboundId = cached[1];
+            syncPosClientboundId   = cached[2];
+            idsResolved            = true;
+            log.fine("[" + botName + "] IDs from cache — sniff skipped");
+        }
+        probeCandidate = PROBE_CANDIDATE_CACHE.getOrDefault(cacheKey, PROBE_ID_MIN);
+    }
+
+    private void seedKnownIds() {
+        if (SERVER_ID_CACHE.containsKey(cacheKey)) return;
+        int[] ids = knownIdsForProtocol(protocolVersion);
+        if (ids != null) {
+            SERVER_ID_CACHE.put(cacheKey, ids);
+            keepAliveClientboundId = ids[0];
+            keepAliveServerboundId = ids[1];
+            syncPosClientboundId   = ids[2];
+            idsResolved            = true;
+            log.fine("[" + botName + "] Seeded known IDs for protocol " + protocolVersion);
+        }
+    }
+
+    private static int[] knownIdsForProtocol(int proto) {
+        if (proto == 774) return new int[]{ 0x26, 0x18, 0x46 }; // 1.21.4
+        if (proto == 770) return new int[]{ 0x26, 0x18, 0x44 }; // 1.21.2/1.21.3
+        if (proto == 769) return new int[]{ 0x26, 0x18, 0x40 }; // 1.21.1
+        if (proto == 767) return new int[]{ 0x24, 0x18, 0x40 }; // 1.21
+        if (proto == 765) return new int[]{ 0x24, 0x18, 0x3E }; // 1.20.4
+        if (proto == 764) return new int[]{ 0x23, 0x18, 0x3C }; // 1.20.2
+        if (proto == 763) return new int[]{ 0x23, 0x17, 0x3A }; // 1.20/1.20.1
+        return null;
+    }
+
+    public void invalidateCache() {
+        SERVER_ID_CACHE.remove(cacheKey);
+        idsResolved            = false;
+        keepAliveServerboundId = -1;
+        syncPosClientboundId   = -1;
+    }
+
+    public int getProbeCandidate() { return probeCandidate; }
+
+    public void setProtocolVersion(int v) {
+        this.protocolVersion = v;
+        log.fine("[" + botName + "] Protocol version: " + v);
+        seedKnownIds();
+    }
+
+    public static int queryProtocolVersion(String host, int port, Logger log) {
+        try (Socket s = new Socket(host, port)) {
+            s.setSoTimeout(5_000);
+            DataOutputStream o = new DataOutputStream(new BufferedOutputStream(s.getOutputStream()));
+            DataInputStream  i = new DataInputStream(new BufferedInputStream(s.getInputStream()));
+
+            ByteArrayOutputStream buf = new ByteArrayOutputStream();
+            writeVarInt(buf, PROTO_FALLBACK); writeString(buf, host); writeShort(buf, port); writeVarInt(buf, 1);
+            sendFramedNoCompression(o, 0x00, buf.toByteArray());
+            sendFramedNoCompression(o, 0x00, new byte[0]); o.flush();
+
+            int len = readVarInt(i); byte[] raw = readExactly(i, len);
+            DataInputStream d = new DataInputStream(new ByteArrayInputStream(raw));
+            if (readVarInt(d) != 0x00) return -1;
+            String json = readString(d);
+
+            java.util.regex.Matcher m = java.util.regex.Pattern.compile("\"protocol\"\\s*:\\s*(-?\\d+)").matcher(json);
+            if (m.find()) return Integer.parseInt(m.group(1));
+        } catch (Exception ignored) {}
+        return -1;
+    }
+
+    public void initiateLogin(String host, int port, String name, UUID uuid) throws IOException {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        writeVarInt(buf, protocolVersion); writeString(buf, host); writeShort(buf, port); writeVarInt(buf, 2);
+        sendRaw(S_HANDSHAKE, buf.toByteArray());
+
+        buf.reset(); writeString(buf, name);
+        writeLong(buf, uuid.getMostSignificantBits()); writeLong(buf, uuid.getLeastSignificantBits());
+        sendRaw(S_LOGIN_START, buf.toByteArray());
+    }
+
+    public boolean completeLogin(String name) throws IOException {
+        for (int i = 0; i < 50; i++) {
+            Packet pkt = readPacket();
+            switch (pkt.id) {
+                case C_SET_COMPRESSION -> {
+                    compressionThreshold = readVarInt(pkt.stream());
+                    compressionEnabled   = compressionThreshold >= 0;
+                }
+                case C_LOGIN_SUCCESS -> {
+                    DataInputStream d = pkt.stream(); d.skipBytes(16); readString(d);
+                    int props = readVarInt(d);
+                    for (int p = 0; p < props; p++) {
+                        readString(d); readString(d); if (d.readBoolean()) readString(d);
+                    }
+                    sendRaw(S_LOGIN_ACK, new byte[0]);
+                    return completeConfiguration();
+                }
+                case C_DISCONNECT_LOGIN -> {
+                    log.warning("[" + name + "] Login kick: " + readString(pkt.stream()));
+                    return false;
+                }
+                case C_ENCRYPTION_REQUEST, C_LOGIN_PLUGIN_REQUEST -> { return false; }
+            }
+        }
+        return false;
+    }
+
+    private boolean completeConfiguration() throws IOException {
+        ByteArrayOutputStream ci = new ByteArrayOutputStream();
+        writeString(ci, "en_us"); ci.write(10); writeVarInt(ci, 0); ci.write(1); ci.write(0x7F);
+        writeVarInt(ci, 1); ci.write(0); ci.write(1);
+        if (protocolVersion >= 770) writeVarInt(ci, 2);
+        sendRaw(S_CONFIG_CLIENT_INFO, ci.toByteArray());
+
+        for (int i = 0; i < 400; i++) {
+            Packet pkt = readPacket();
+            switch (pkt.id) {
+                case C_CONFIG_FINISH -> {
+                    sendRaw(S_CONFIG_ACK, new byte[0]);
+                    return true;
+                }
+                case C_CONFIG_KEEPALIVE -> {
+                    long id = pkt.stream().readLong();
+                    ByteArrayOutputStream r = new ByteArrayOutputStream(); writeLong(r, id);
+                    sendRaw(S_CONFIG_KEEPALIVE, r.toByteArray());
+                }
+                case C_CONFIG_PING -> {
+                    int pingId = pkt.stream().readInt();
+                    ByteArrayOutputStream r = new ByteArrayOutputStream();
+                    r.write((pingId >> 24) & 0xFF); r.write((pingId >> 16) & 0xFF);
+                    r.write((pingId >>  8) & 0xFF); r.write(pingId & 0xFF);
+                    sendRaw(0x04, r.toByteArray());
+                }
+                case C_CONFIG_DISCONNECT -> { return false; }
+                case C_CONFIG_KNOWN_PACKS -> {
+                    ByteArrayOutputStream r = new ByteArrayOutputStream(); writeVarInt(r, 0);
+                    sendRaw(S_CONFIG_KNOWN_PACKS, r.toByteArray());
+                }
+                case C_CONFIG_PLUGIN_MSG -> {
+                    DataInputStream d = pkt.stream();
+                    if ("minecraft:brand".equals(readString(d))) {
+                        ByteArrayOutputStream r = new ByteArrayOutputStream();
+                        writeString(r, "minecraft:brand"); writeString(r, "vanilla");
+                        sendRaw(S_CONFIG_PLUGIN_MSG, r.toByteArray());
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    public void readAndHandle(BotClient bot) throws IOException {
+        Packet pkt = readPacket();
+
+        if (pkt.id >= 0x17 && pkt.id <= 0x30 && pkt.data.length > 2) {
+            String reason = safeReadJsonString(pkt.data);
+            if (reason != null) throw new IOException("Kicked: " + reason);
+        }
+
+        if (idsResolved) {
+            handleNormal(pkt, bot);
         } else {
-            // 如果尚未探测出正确值，获取当前这台服务器探测到了哪个步长候选值
-            this.currentProbeCandidate = PROBE_CANDIDATE_CACHE.computeIfAbsent(cacheKey, k -> 0x00);
+            handleSniff(pkt, bot);
         }
+    }
 
-        // 2. Handshake
-        ByteArrayOutputStream hba = new ByteArrayOutputStream();
-        writeVarInt(hba, 0x00); // Packet ID
-        writeVarInt(hba, protocolVersion);
-        writeString(hba, host);
-        writeShort(hba, port);
-        writeVarInt(hba, 3); // Next State = Login
-        writePacket(hba.toByteArray());
-        this.state = 3;
+    private int sniffCount = 0;
 
-        // 3. Login Start
-        ByteArrayOutputStream lba = new ByteArrayOutputStream();
-        writeVarInt(lba, 0x00); // Login Start ID
-        writeString(lba, name);
-        writeLong(lba, uuid.getMostSignificantBits());
-        writeLong(lba, uuid.getLeastSignificantBits());
-        writePacket(lba.toByteArray());
+    private void handleSniff(Packet pkt, BotClient bot) throws IOException {
+        sniffCount++;
 
-        // 4. 处理 Login & Config 数据包循环
-        while (this.state != 6) { // 循环直到切入 Play 状态
-            DataPacket p = readPacket();
-            if (p == null) throw new IOException("在握手或配置阶段遭遇流断开");
-
-            if (this.state == 3) {
-                handleLoginState(p);
-            } else if (this.state == 5) {
-                handleConfigState(p);
+        // ── Step 1: detect SyncPos ─────────────────────────────────────────
+        if (syncPosClientboundId == -1 && pkt.data.length >= 28) {
+            SyncPosResult sp = trySyncPos(pkt);
+            if (sp != null) {
+                syncPosClientboundId = pkt.id;
+                ByteArrayOutputStream r = new ByteArrayOutputStream();
+                writeVarInt(r, sp.teleportId);
+                sendRaw(S_CONFIRM_TELEPORT, r.toByteArray());
+                bot.updatePosition(sp.x, sp.y, sp.z, sp.yaw, sp.pitch);
+                
+                // If IDs are loaded directly from a seeded version, allow fast tracking
+                if (idsResolved) triggerLoginVerifiedOnce(bot);
+                return;
             }
         }
-    }
 
-    private void handleLoginState(DataPacket p) throws Exception {
-        int id = p.id;
-        if (id == 0x03) { // Set Compression
-            this.compressionThreshold = readVarInt(p.payload);
-        } else if (id == 0x02) { // Login Success
-            this.state = 5; // 进入 Configuration 阶段 (1.20.2+)
-        } else if (id == 0x00) { // Login Disconnect
-            String reason = readString(p.payload);
-            throw new IOException("被服务器拒绝登录: " + reason);
-        }
-    }
+        // ── Step 2: detect clientbound KeepAlive ──────────────────────────
+        if (keepAliveClientboundId == -1
+                && syncPosClientboundId != -1
+                && pkt.data.length == 8
+                && pkt.id != syncPosClientboundId
+                && isPlausibleKeepAliveClientboundId(pkt.id)) {
 
-    private void handleConfigState(DataPacket p) throws Exception {
-        int id = p.id;
-        if (id == 0x00) { // Cookie Request / KeepAlive
-            // 响应配置阶段的应答，保持通道畅通
-            ByteArrayOutputStream ba = new ByteArrayOutputStream();
-            writeVarInt(ba, 0x00);
-            byte[] rem = readRemaining(p.payload);
-            ba.write(rem);
-            writePacket(ba.toByteArray());
-        } else if (id == 0x03) { // Registry Data 或 Finish Configuration
-            // 自动对部分常见包做盲答或等待 Finish Config
-        } else if (id == 0x02) { // Finish Configuration (服务器发送)
-            // 回应 Finish Configuration 到服务器
-            ByteArrayOutputStream ba = new ByteArrayOutputStream();
-            writeVarInt(ba, 0x02);
-            writePacket(ba.toByteArray());
-            
-            // 彻底切入 Play 状态
-            this.state = 6; 
-        }
-    }
+            keepAliveClientboundId = pkt.id;
+            pendingKeepAliveId     = pkt.stream().readLong();
 
-    /**
-     * 运行于 BotReader 线程中的主 Play 状态包监听循环
-     */
-    public void readLoop() throws Exception {
-        while (bot.isConnected()) {
-            DataPacket p = readPacket();
-            if (p == null) break;
-
-            if (idsResolved) {
-                // ─── 核心情况 A：已经存在正确的记录值，直接使用 ───
-                if (p.id == cbKeepAliveId) {
-                    sendKeepAliveResponse(p.payload, sbKeepAliveId);
-                } else if (p.id == syncPosId) {
-                    // 接收到坐标包说明成功下落进世界
-                    triggerLoginVerifiedOnce();
-                }
+            if (keepAliveServerboundId >= 0) {
+                cacheAndResolve();
+                sendKeepAlive(pendingKeepAliveId);
+                triggerLoginVerifiedOnce(bot);
             } else {
-                // ─── 核心情况 B：没有缓存，进行全自动 ID 嗅探与自适应测试 ───
-                // 1. 如果长度是 8 字节（Long），它是服务器的 KeepAlive 探测包
-                if (p.payload.available() == 8) {
-                    this.cbKeepAliveId = p.id;
-                    // 使用当前独占的候选值，向服务器回应并测试是否正确
-                    this.sbKeepAliveId = currentProbeCandidate;
-                    
-                    plugin.getLogger().info("[探针] 捕获客户端 KeepAlive 包 ID: 0x" + Integer.toHexString(cbKeepAliveId) 
-                            + "，正在使用候选 Serverbound ID: 0x" + Integer.toHexString(sbKeepAliveId) + " 进行回放测试...");
-                    
-                    sendKeepAliveResponse(p.payload, this.sbKeepAliveId);
-                } 
-                // 2. 捕获同步包：坐标同步包通常包含 3 个 Double 加上标志，长度通常在 30 ~ 40 字节之间
-                else if (p.payload.available() >= 30 && p.payload.available() <= 50) {
-                    this.syncPosId = p.id;
-                    plugin.getLogger().info("[探针] 捕获世界坐标同步包 ID: 0x" + Integer.toHexString(syncPosId));
-                    
-                    // 只要能稳定收到坐标同步且未被服务器因 KeepAlive 猜错而断开，基本说明当前猜测的 ID 组合完美正确！
-                    // 将正确值记录并锁死进静态全局缓存，后续所有假人直接享用成果！
-                    SERVER_ID_CACHE.put(cacheKey, new int[]{cbKeepAliveId, sbKeepAliveId, syncPosId});
-                    this.idsResolved = true;
-                    
-                    triggerLoginVerifiedOnce();
-                }
+                int offset = (protocolVersion >= 764) ? 0x0E : 0x0C;
+                int guessedSB = Math.max(1, keepAliveClientboundId - offset);
+                ByteArrayOutputStream kaR = new ByteArrayOutputStream();
+                writeLong(kaR, pendingKeepAliveId);
+                sendRaw(guessedSB, kaR.toByteArray());
+                
+                probeCandidate = guessedSB;
+                PROBE_CANDIDATE_CACHE.put(cacheKey, probeCandidate);
+            }
+            return;
+        }
+
+        // ── Step 2b: second KeepAlive arrived → probe succeeded ────────────
+        if (keepAliveClientboundId >= 0
+                && keepAliveServerboundId < 0
+                && pkt.id == keepAliveClientboundId
+                && pkt.data.length == 8) {
+            confirmProbe(pkt.stream().readLong(), bot);
+            return;
+        }
+
+        // ── Step 3: Fallback ──────────────────────────────────────────────
+        if (sniffCount >= SNIFF_WINDOW) {
+            if (keepAliveClientboundId >= 0 && keepAliveServerboundId < 0) return;
+            if (keepAliveClientboundId < 0) keepAliveClientboundId = fallbackClientboundKeepAliveId(protocolVersion);
+            if (keepAliveServerboundId < 0) {
+                int offset = (protocolVersion >= 764) ? 0x0E : 0x0C;
+                keepAliveServerboundId = Math.max(1, keepAliveClientboundId - offset);
+            }
+            if (syncPosClientboundId < 0) syncPosClientboundId = fallbackSyncPosId(protocolVersion);
+            cacheAndResolve();
+            triggerLoginVerifiedOnce(bot);
+        }
+    }
+
+    private void cacheAndResolve() {
+        SERVER_ID_CACHE.put(cacheKey, new int[]{ keepAliveClientboundId, keepAliveServerboundId, syncPosClientboundId });
+        PROBE_CANDIDATE_CACHE.remove(cacheKey);
+        idsResolved = true;
+    }
+
+    private boolean isPlausibleKeepAliveClientboundId(int id) {
+        if (protocolVersion >= 770) return id >= 0x22 && id <= 0x2A;
+        if (protocolVersion >= 764) return id >= 0x1F && id <= 0x2A;
+        return id >= 0x1C && id <= 0x28;
+    }
+
+    private static int fallbackClientboundKeepAliveId(int proto) {
+        return (proto >= 764) ? 0x23 : 0x21;
+    }
+
+    private static int fallbackSyncPosId(int proto) {
+        if (proto >= 774) return 0x46;
+        if (proto >= 770) return 0x44;
+        return 0x3E;
+    }
+
+    private void confirmProbe(long newKeepAliveId, BotClient bot) throws IOException {
+        keepAliveServerboundId = probeCandidate;
+        cacheAndResolve();
+        pendingKeepAliveId = newKeepAliveId;
+        sendKeepAlive(pendingKeepAliveId);
+        triggerLoginVerifiedOnce(bot);
+    }
+
+    private void handleNormal(Packet pkt, BotClient bot) throws IOException {
+        if (pkt.id == keepAliveClientboundId && pkt.data.length == 8) {
+            long id = pkt.stream().readLong();
+            if (keepAliveServerboundId < 0) {
+                confirmProbe(id, bot);
+            } else {
+                sendKeepAlive(id);
+                // Also ensures stable verification for seed-bypassed logins on first world packet ticks
+                triggerLoginVerifiedOnce(bot);
+            }
+            return;
+        }
+
+        if (pkt.id == syncPosClientboundId && pkt.data.length >= 28) {
+            SyncPosResult sp = trySyncPos(pkt);
+            if (sp != null) {
+                ByteArrayOutputStream r = new ByteArrayOutputStream();
+                writeVarInt(r, sp.teleportId);
+                sendRaw(S_CONFIRM_TELEPORT, r.toByteArray());
+                bot.updatePosition(sp.x, sp.y, sp.z, sp.yaw, sp.pitch);
+                triggerLoginVerifiedOnce(bot);
             }
         }
-
-        // 退出循环，说明断开了。如果是探测阶段挂掉，判定是 ID 猜错了
-        if (!idsResolved) {
-            // 累加步长，为下一个插队重连的假人铺路
-            currentProbeCandidate++;
-            PROBE_CANDIDATE_CACHE.put(cacheKey, currentProbeCandidate);
-            // 标记 BotClient 进行无缝插队重连
-            bot.setProbeFailedReconnect(true);
-        }
     }
 
-    private void sendKeepAliveResponse(DataInputStream payload, int responseId) throws Exception {
-        long challenge = payload.readLong();
-        ByteArrayOutputStream ba = new ByteArrayOutputStream();
-        writeVarInt(ba, responseId);
-        writeLong(ba, challenge);
-        writePacket(ba.toByteArray());
+    private void sendKeepAlive(long id) throws IOException {
+        ByteArrayOutputStream r = new ByteArrayOutputStream(); writeLong(r, id);
+        sendRaw(keepAliveServerboundId < 0 ? probeCandidate : keepAliveServerboundId, r.toByteArray());
     }
 
-    private void triggerLoginVerifiedOnce() {
+    private void triggerLoginVerifiedOnce(BotClient bot) {
         if (!loginVerifiedTriggered) {
             loginVerifiedTriggered = true;
             bot.onProtocolLoginVerified();
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // 基础底层 Packet 读写封装（含 VarInt 与可选的 Zlib 解压机制）
-    // ═══════════════════════════════════════════════════════════════════════
-
-    private static class DataPacket {
-        int id;
-        DataInputStream payload;
-        DataPacket(int id, byte[] data) {
-            this.id = id;
-            this.payload = new DataInputStream(new ByteArrayInputStream(data));
-        }
+    public int nextProbeCandidate() {
+        probeCandidate++;
+        if (probeCandidate == S_CONFIRM_TELEPORT) probeCandidate++;
+        PROBE_CANDIDATE_CACHE.put(cacheKey, probeCandidate);
+        return probeCandidate;
     }
 
-    private DataPacket readPacket() throws Exception {
-        int length = readVarInt(in);
-        if (length <= 0) return null;
+    private record SyncPosResult(int teleportId, double x, double y, double z, float yaw, float pitch) {}
 
-        byte[] data = new byte[length];
-        int read = 0;
-        while (read < length) {
-            int c = in.read(data, read, length - read);
-            if (c == -1) return null;
-            read += c;
-        }
-
-        DataInputStream dis = new DataInputStream(new ByteArrayInputStream(data));
-        if (compressionThreshold >= 0) {
-            int dataLength = readVarInt(dis);
-            if (dataLength != 0) {
-                byte[] compressed = readRemaining(dis);
-                byte[] uncompressed = decompress(compressed);
-                dis = new DataInputStream(new ByteArrayInputStream(uncompressed));
-            }
-        }
-
-        int packetId = readVarInt(dis);
-        byte[] payload = readRemaining(dis);
-        return new DataPacket(packetId, payload);
+    private SyncPosResult trySyncPos(Packet pkt) {
+        SyncPosResult a = trySyncPosLayoutA(pkt); return (a != null) ? a : trySyncPosLayoutB(pkt);
     }
 
-    private void writePacket(byte[] packetData) throws Exception {
-        if (compressionThreshold >= 0) {
-            if (packetData.length >= compressionThreshold) {
-                ByteArrayOutputStream dataLengthBuf = new ByteArrayOutputStream();
-                writeVarInt(dataLengthBuf, packetData.length);
-                byte[] compressed = compress(packetData);
-                
-                ByteArrayOutputStream packetBuf = new ByteArrayOutputStream();
-                writeVarInt(packetBuf, dataLengthBuf.size() + compressed.length);
-                packetBuf.write(dataLengthBuf.toByteArray());
-                packetBuf.write(compressed);
-                out.write(packetBuf.toByteArray());
-                out.flush();
-                return;
+    private SyncPosResult trySyncPosLayoutA(Packet pkt) {
+        if (pkt.data.length < 29) return null;
+        try {
+            DataInputStream d = pkt.stream(); int tid = readVarInt(d);
+            if (tid < 0 || tid > 0xFFFF) return null;
+            double x = d.readDouble(), y = d.readDouble(), z = d.readDouble();
+            if (!coord(x) || !coord(y) || !coord(z)) return null;
+            d.readDouble(); d.readDouble(); d.readDouble();
+            float yaw = d.readFloat(), pitch = d.readFloat();
+            return new SyncPosResult(tid, x, y, z, yaw, pitch);
+        } catch (Exception e) { return null; }
+    }
+
+    private SyncPosResult trySyncPosLayoutB(Packet pkt) {
+        if (pkt.data.length < 29) return null;
+        try {
+            DataInputStream d = pkt.stream();
+            double x = d.readDouble(), y = d.readDouble(), z = d.readDouble();
+            if (!coord(x) || !coord(y) || !coord(z)) return null;
+            float yaw = d.readFloat(), pitch = d.readFloat(); d.readByte();
+            int tid = readVarInt(d); if (tid < 0 || tid > 0xFFFF) return null;
+            return new SyncPosResult(tid, x, y, z, yaw, pitch);
+        } catch (Exception e) { return null; }
+    }
+
+    private static boolean coord(double v) { return !Double.isNaN(v) && !Double.isInfinite(v) && Math.abs(v) <= MAX_COORD; }
+
+    private synchronized void sendRaw(int packetId, byte[] payload) throws IOException {
+        ByteArrayOutputStream idBuf = new ByteArrayOutputStream(); writeVarInt(idBuf, packetId); idBuf.write(payload);
+        byte[] data = idBuf.toByteArray(); ByteArrayOutputStream frame = new ByteArrayOutputStream();
+        if (compressionEnabled) {
+            ByteArrayOutputStream inner = new ByteArrayOutputStream();
+            if (data.length >= compressionThreshold) {
+                writeVarInt(inner, data.length); inner.write(compress(data));
             } else {
-                ByteArrayOutputStream packetBuf = new ByteArrayOutputStream();
-                ByteArrayOutputStream totalBuf = new ByteArrayOutputStream();
-                writeVarInt(totalBuf, 0); // Uncompressed length = 0
-                totalBuf.write(packetData);
-                
-                writeVarInt(packetBuf, totalBuf.size());
-                packetBuf.write(totalBuf.toByteArray());
-                out.write(packetBuf.toByteArray());
-                out.flush();
-                return;
+                writeVarInt(inner, 0); inner.write(data);
             }
+            byte[] ib = inner.toByteArray(); writeVarInt(frame, ib.length); frame.write(ib);
+        } else {
+            writeVarInt(frame, data.length); frame.write(data);
         }
-
-        ByteArrayOutputStream packetBuf = new ByteArrayOutputStream();
-        writeVarInt(packetBuf, packetData.length);
-        packetBuf.write(packetData);
-        out.write(packetBuf.toByteArray());
-        out.flush();
+        out.write(frame.toByteArray()); out.flush();
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // 数据流辅助读写原生方法
-    // ═══════════════════════════════════════════════════════════════════════
+    private static void sendFramedNoCompression(DataOutputStream o, int id, byte[] payload) throws IOException {
+        ByteArrayOutputStream idBuf = new ByteArrayOutputStream(); writeVarInt(idBuf, id); idBuf.write(payload);
+        byte[] data = idBuf.toByteArray(); ByteArrayOutputStream frame = new ByteArrayOutputStream();
+        writeVarInt(frame, data.length); frame.write(data); o.write(frame.toByteArray()); o.flush();
+    }
 
-    public static int readVarInt(InputStream in) throws IOException {
-        int value = 0, position = 0;
-        while (true) {
-            int b = in.read();
-            if (b == -1) throw new EOFException();
-            value |= (b & 0x7F) << position;
-            if ((b & 0x80) == 0) break;
-            position += 7;
-            if (position >= 32) throw new IOException("VarInt 太长了");
+    private Packet readPacket() throws IOException {
+        int pktLen = readVarInt(in);
+        if (!compressionEnabled) {
+            byte[] raw = readExactly(in, pktLen);
+            DataInputStream d = new DataInputStream(new ByteArrayInputStream(raw));
+            return new Packet(readVarInt(d), d.readAllBytes());
+        } else {
+            byte[] outer = readExactly(in, pktLen);
+            DataInputStream od = new DataInputStream(new ByteArrayInputStream(outer));
+            int dataLen = readVarInt(od); byte[] inner = od.readAllBytes();
+            byte[] unc = (dataLen == 0) ? inner : decompress(inner);
+            DataInputStream d = new DataInputStream(new ByteArrayInputStream(unc));
+            return new Packet(readVarInt(d), d.readAllBytes());
         }
+    }
+
+    private static byte[] readExactly(DataInputStream in, int n) throws IOException {
+        if (n <= 0) return new byte[0]; byte[] buf = new byte[n]; int read = 0;
+        while (read < n) {
+            int r = in.read(buf, read, n - read); if (r < 0) throw new EOFException();
+            read += r;
+        }
+        return buf;
+    }
+
+    public static int readVarInt(DataInputStream in) throws IOException {
+        int value = 0, shift = 0; byte b;
+        do {
+            b = in.readByte(); value |= (b & 0x7F) << shift; shift += 7;
+            if (shift > 35) throw new IOException("VarInt too large");
+        } while ((b & 0x80) != 0);
         return value;
     }
 
-    public static void writeVarInt(OutputStream out, int value) throws IOException {
-        while (true) {
-            if ((value & ~0x7F) == 0) {
-                out.write(value);
-                return;
-            }
-            out.write((value & 0x7F) | 0x80);
-            value >>>= 7;
-        }
+    private static void writeVarInt(OutputStream out, int v) throws IOException {
+        while ((v & ~0x7F) != 0) { out.write((v & 0x7F) | 0x80); v >>>= 7; } out.write(v);
     }
 
-    private String readString(DataInputStream in) throws IOException {
-        int len = readVarInt(in);
-        byte[] b = new byte[len];
-        in.readFully(b);
-        return new String(b, StandardCharsets.UTF_8);
+    private static String readString(DataInputStream in) throws IOException { return new String(readExactly(in, readVarInt(in)), StandardCharsets.UTF_8); }
+
+    private static String safeReadJsonString(byte[] data) {
+        try {
+            DataInputStream d = new DataInputStream(new ByteArrayInputStream(data)); int len = readVarInt(d);
+            if (len <= 0 || len > data.length) return null;
+            String result = new String(readExactly(d, len), StandardCharsets.UTF_8);
+            return (result.startsWith("{") || result.startsWith("\"")) ? result : null;
+        } catch (Exception e) { return null; }
     }
 
-    private void writeString(OutputStream out, String s) throws IOException {
-        byte[] b = s.getBytes(StandardCharsets.UTF_8);
-        writeVarInt(out, b.length);
-        out.write(b);
+    private static void writeString(OutputStream out, String s) throws IOException {
+        byte[] b = s.getBytes(StandardCharsets.UTF_8); writeVarInt(out, b.length); out.write(b);
     }
 
-    private void writeLong(OutputStream out, long v) throws IOException {
-        for (int i = 7; i >= 0; i--) out.write((int)((v >> (i * 8)) & 0xFF));
-    }
-
-    private void writeShort(OutputStream out, int v) throws IOException {
-        out.write((v >> 8) & 0xFF); out.write(v & 0xFF);
-    }
-
-    private byte[] readRemaining(DataInputStream in) throws IOException {
-        ByteArrayOutputStream bos = new ByteArrayOutputStream();
-        byte[] buf = new byte[1024];
-        int read;
-        while ((read = in.read(buf)) != -1) bos.write(buf, 0, read);
-        return bos.toByteArray();
-    }
+    private static void writeLong(OutputStream out, long v) throws IOException { for (int i = 7; i >= 0; i--) out.write((int)((v >> (i * 8)) & 0xFF)); }
+    private static void writeShort(OutputStream out, int v) throws IOException { out.write((v >> 8) & 0xFF); out.write(v & 0xFF); }
 
     private static byte[] compress(byte[] data) throws IOException {
-        java.util.zip.Deflater df = new java.util.zip.Deflater();
-        df.setInput(data); df.finish();
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        byte[] buf = new byte[1024];
-        while (!df.finished()) out.write(buf, 0, df.deflate(buf));
-        df.end();
-        return out.toByteArray();
+        java.util.zip.Deflater df = new java.util.zip.Deflater(); df.setInput(data); df.finish();
+        ByteArrayOutputStream out = new ByteArrayOutputStream(); byte[] buf = new byte[8192];
+        while (!df.finished()) out.write(buf, 0, df.deflate(buf)); df.end(); return out.toByteArray();
     }
 
     private static byte[] decompress(byte[] data) throws IOException {
-        java.util.zip.Inflater inf = new java.util.zip.Inflater();
-        inf.setInput(data);
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        byte[] buf = new byte[1024];
+        java.util.zip.Inflater inf = new java.util.zip.Inflater(); inf.setInput(data);
+        ByteArrayOutputStream out = new ByteArrayOutputStream(); byte[] buf = new byte[8192];
         try { while (!inf.finished()) out.write(buf, 0, inf.inflate(buf)); }
-        catch (java.util.zip.DataFormatException e) { throw new IOException("解压 Zlib 失败", e); }
-        inf.end();
-        return out.toByteArray();
+        catch (java.util.zip.DataFormatException e) { throw new IOException("Decompress", e); }
+        inf.end(); return out.toByteArray();
+    }
+
+    private record Packet(int id, byte[] data) {
+        DataInputStream stream() { return new DataInputStream(new ByteArrayInputStream(data)); }
     }
 }
