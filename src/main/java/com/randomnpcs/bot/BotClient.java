@@ -92,17 +92,16 @@ public class BotClient {
         String cacheKey = host + ":" + port;
         Integer cachedProto = PROTO_CACHE.get(cacheKey);
         if (cachedProto != null) {
-            // Already know the protocol — skip the status-ping round-trip
             proto.setProtocolVersion(cachedProto);
-            plugin.getLogger().info("[" + name + "] Using cached protocol version: " + cachedProto);
+            plugin.getLogger().fine("[" + name + "] Using cached protocol: " + cachedProto);
         } else {
             int detectedProto = MinecraftProtocol.queryProtocolVersion(host, port, plugin.getLogger());
             if (detectedProto > 0) {
                 proto.setProtocolVersion(detectedProto);
-                PROTO_CACHE.put(cacheKey, detectedProto); // save for all future bots
-                plugin.getLogger().info("[" + name + "] Protocol " + detectedProto + " cached for future connections");
+                PROTO_CACHE.put(cacheKey, detectedProto);
+                plugin.getLogger().fine("[" + name + "] Protocol " + detectedProto + " cached");
             } else {
-                plugin.getLogger().warning("[" + name + "] Could not detect protocol, using fallback");
+                plugin.getLogger().fine("[" + name + "] Could not detect protocol, using fallback");
             }
         }
 
@@ -114,7 +113,7 @@ public class BotClient {
         }
 
         connected = true;
-        plugin.getLogger().info("Bot connected: " + name);
+        plugin.getLogger().info(name + " joined the game");
 
         startReaderThread();
         Bukkit.getScheduler().runTaskLaterAsynchronously(plugin, () -> {
@@ -140,17 +139,17 @@ public class BotClient {
                 String msg = e.getMessage() != null ? e.getMessage() : "";
 
                 if (msg.startsWith("Kicked:")) {
-                    plugin.getLogger().info("Bot " + name + " kicked: " + msg.substring(7).trim());
+                    plugin.getLogger().info(name + " left the game");
 
                 } else if (isProbeDecodeError(msg)) {
                     int nextId = proto.nextProbeCandidate();
-                    plugin.getLogger().info("[" + name + "] Probe 0x"
+                    plugin.getLogger().fine("[" + name + "] Probe 0x"
                             + Integer.toHexString(proto.getProbeCandidate() - 1)
                             + " rejected → trying 0x" + Integer.toHexString(nextId));
                     probeFailedReconnect = true;
 
                 } else {
-                    plugin.getLogger().info("Bot " + name + " disconnected: " + msg);
+                    plugin.getLogger().info(name + " left the game");
                 }
             } finally {
                 handleDisconnect();
@@ -212,7 +211,7 @@ public class BotClient {
             Player p = Bukkit.getPlayerExact(name);
             if (p != null && p.isOnline()) {
                 p.chat(finalMsg);
-                plugin.getLogger().info("[Bot:" + name + "] " + finalMsg);
+                plugin.getLogger().info("<" + name + "> " + finalMsg);
             }
         });
     }
@@ -479,11 +478,11 @@ public class BotClient {
         closeSocket();
 
         if (probeFailedReconnect) {
-            plugin.getLogger().info("Bot " + name + " reconnecting for probe...");
+            plugin.getLogger().fine("[" + name + "] Probe reconnect in progress");
             probeFailedReconnect = false;
             manager.onBotProbeReconnect(name);
         } else {
-            plugin.getLogger().info("Bot " + name + " disconnected — scheduling respawn.");
+            plugin.getLogger().fine("[" + name + "] Scheduling respawn");
             manager.onBotDied(name);
         }
     }

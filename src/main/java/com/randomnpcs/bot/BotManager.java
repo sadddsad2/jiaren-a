@@ -6,7 +6,6 @@ import org.bukkit.scheduler.BukkitTask;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.logging.Level;
 
 /**
  * Manages all active bot connections and lifecycle.
@@ -41,7 +40,7 @@ public class BotManager {
         int max = plugin.getConfig().getInt("bot-count-max", 10);
         targetBotCount = min + random.nextInt(max - min + 1);
 
-        plugin.getLogger().info("Spawning " + targetBotCount + " random bots...");
+        plugin.getLogger().fine("Spawning " + targetBotCount + " bots...");
 
         for (int i = 0; i < targetBotCount; i++) {
             final int delay = i * 10; // stagger connections by 0.5s each
@@ -54,7 +53,7 @@ public class BotManager {
      */
     public void stopAllBots() {
         running = false;
-        plugin.getLogger().info("Stopping all " + activeBots.size() + " bots...");
+        plugin.getLogger().fine("Stopping all " + activeBots.size() + " bots...");
         List<BotClient> toStop = new ArrayList<>(activeBots.values());
         for (BotClient bot : toStop) {
             bot.disconnect("Plugin shutting down");
@@ -73,7 +72,7 @@ public class BotManager {
         if (!running) return;
 
         int respawnDelay = plugin.getConfig().getInt("respawn-delay", 5) * 20; // ticks
-        plugin.getLogger().info("Bot " + botName + " died. Respawning in " + (respawnDelay / 20) + "s...");
+        plugin.getLogger().fine("Bot " + botName + " died, respawning in " + (respawnDelay / 20) + "s...");
 
         Bukkit.getScheduler().runTaskLaterAsynchronously(plugin, this::connectNewBot, respawnDelay);
     }
@@ -95,14 +94,14 @@ public class BotManager {
             if (!running) return;
             String host = plugin.getServerHost();
             int port    = plugin.getServerPort();
-            plugin.getLogger().info("Probe reconnect: " + botName + " -> " + host + ":" + port);
+            plugin.getLogger().fine("Probe reconnect: " + botName + " -> " + host + ":" + port);
 
             BotClient bot = new BotClient(plugin, this, botName, host, port);
             activeBots.put(botName, bot);
             try {
                 bot.connect();
             } catch (Exception e) {
-                plugin.getLogger().warning("Probe reconnect failed for " + botName + ": " + e.getMessage());
+                plugin.getLogger().fine("Probe reconnect failed for " + botName + ": " + e.getMessage());
                 activeBots.remove(botName);
                 usedNames.remove(botName);
                 onBotDied(botName);
@@ -122,7 +121,7 @@ public class BotManager {
         String host = plugin.getServerHost();
         int port = plugin.getServerPort();
 
-        plugin.getLogger().info("Connecting bot: " + name + " -> " + host + ":" + port);
+        plugin.getLogger().fine("Connecting bot: " + name + " -> " + host + ":" + port);
 
         BotClient bot = new BotClient(plugin, this, name, host, port);
         activeBots.put(name, bot);
@@ -130,8 +129,7 @@ public class BotManager {
         try {
             bot.connect();
         } catch (Exception e) {
-            // Log full stack so protocol errors are visible in console
-            plugin.getLogger().log(Level.WARNING, "Failed to connect bot " + name, e);
+            plugin.getLogger().fine("Failed to connect bot " + name + ": " + e.getMessage());
             activeBots.remove(name);
             usedNames.remove(name);
         }
