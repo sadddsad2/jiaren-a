@@ -20,42 +20,30 @@ import java.util.logging.Logger;
  *   All gameplay actions are handled server-side via the Paper API.
  *
  * ══════════════════════════════════════════════════════════════════════
- * Fully adaptive KeepAlive ID detection strategy:
+ * KeepAlive ID resolution — three-tier strategy (detect once, reuse forever):
  *
- *   Fact: the server WILL kick the bot if KeepAlive is not echoed within
- *   ~30 seconds. But if we send the wrong packet ID, the server decodes
- *   it as a different packet and crashes with a decode error.
+ *   SERVER_ID_CACHE stores int[]{cbKeepAlive, sbKeepAlive, syncPos} per server.
+ *   Once all three IDs are known the entry is written and every subsequent bot
+ *   instance loads it in the constructor, sets idsResolved = true immediately,
+ *   and never enters the sniff/probe loop at all.
  *
- *   Solution — binary probe:
+ *   Tier 1 — Protocol table (instant, zero reconnects):
+ *     Known triplets for common protocol versions are seeded at construction.
+ *     For protocol 774 (1.21.4): {0x26, 0x18, 0x46}.
  *
- *   Step 1 (sniff): Observe Play-state packets to find the SyncPos packet
- *     and the clientbound KeepAlive packet (the only 8-byte packet after
- *     SyncPos in the early join window).
+ *   Tier 2 — Sniff + probe (adaptive, works for any version):
+ *     Step 1: sniff SyncPos packet.
+ *     Step 2: sniff clientbound KeepAlive (first plausible 8-byte packet
+ *             after SyncPos in the expected ID range).
+ *     Step 3: probe serverbound ID by sending the Long with candidate IDs;
+ *             a decode-error disconnect → increment candidate (persisted in
+ *             PROBE_CANDIDATE_CACHE across reconnects) and reconnect.
+ *             A second clientbound KeepAlive arriving without error → confirmed.
+ *     On confirmation all three IDs are written to SERVER_ID_CACHE.
  *
- *   Step 2 (probe): We now know the correct Long value the server is
- *     expecting echoed back. We try candidate serverbound IDs one by one,
- *     in a plausible range, sending each with the correct payload.
- *     - If the server ACKs (does NOT send a disconnect / decode error
- *       within a short window), that ID was correct → lock it in.
- *     - If the server kicks us with a decode error on that ID, try the next.
- *
- *   This approach requires zero hardcoded tables and works for ANY server
- *   version including custom builds (Paper snapshots, Folia, etc.).
- *
- *   Probe range: 0x00–0x3F (covers all known + future versions).
- *   Timeout per probe: if we receive another packet within 200ms without
- *     a decode-error disconnect, we consider it a success.
- *
- *   In practice:
- *   - The correct serverbound ID is always found within a few probes.
- *   - Wrong IDs produce an immediate "Failed to decode packet" disconnect.
- *   - We reconnect and resume probing from the next candidate.
- *
- *   KeepAlive probe coordination:
- *   - BotClient passes a ProbeCallback so we can signal "this ID failed,
- *     try the next one on reconnect" vs "this ID worked, keep using it".
- *   - A static per-server cache (keyed on port) avoids re-probing on
- *     every bot reconnect once we've found the correct pair.
+ *   Tier 3 — Offset fallback (last resort):
+ *     Only fires when sniffCount >= SNIFF_WINDOW AND no probe is active.
+ *     Uses a version-aware offset rather than the old fixed -0x0C delta.
  * ══════════════════════════════════════════════════════════════════════
  */
 public class MinecraftProtocol {
@@ -88,19 +76,30 @@ public class MinecraftProtocol {
     private static final int S_CONFIRM_TELEPORT    = 0x00;
 
     // Probe search space for serverbound KeepAlive ID
-    private static final int PROBE_ID_MIN          = 0x00;
+    private static final int PROBE_ID_MIN          = 0x01; // skip 0x00 (TeleportConfirm)
     private static final int PROBE_ID_MAX          = 0x7F;
 
-    // How many Play packets to watch before expecting KeepAlive (sniff window)
-    private static final int SNIFF_WINDOW          = 64;
+    // Sniff window: raised to 256 so it never fires while a probe is in progress.
+    // A KeepAlive arrives ~20 s after join; on a busy server that's well over 100
+    // packets. 256 gives a comfortable margin.
+    private static final int SNIFF_WINDOW          = 256;
 
     // World-coordinate sanity bounds
     private static final double MAX_COORD          = 3.0e7;
 
-    // ── Per-server resolved ID cache (shared across all bot instances) ────
-    // Key: "host:port", Value: int[]{clientboundKeepAlive, serverboundKeepAlive}
+    // ── Per-server resolved ID cache (shared across ALL bot instances) ────
+    // Key  : "host:port"
+    // Value: int[]{ clientboundKeepAlive, serverboundKeepAlive, syncPosClientbound }
+    //
+    // Once this entry exists the bot skips sniffing entirely (idsResolved = true
+    // immediately in the constructor).
     private static final java.util.concurrent.ConcurrentHashMap<String, int[]>
             SERVER_ID_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
+
+    // Persists the last probe candidate across reconnects so we never retry
+    // a known-bad ID.
+    private static final java.util.concurrent.ConcurrentHashMap<String, Integer>
+            PROBE_CANDIDATE_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
 
     // ── Instance state ────────────────────────────────────────────────────
     private int  keepAliveClientboundId = -1;
@@ -135,25 +134,78 @@ public class MinecraftProtocol {
         this.botName  = botName;
         this.cacheKey = host + ":" + port;
 
-        // Load from cache if already probed for this server
+        // If all three IDs are already cached, restore them and mark resolved.
+        // The bot skips the sniff/probe loop entirely for this connection.
         int[] cached = SERVER_ID_CACHE.get(cacheKey);
         if (cached != null) {
             keepAliveClientboundId = cached[0];
             keepAliveServerboundId = cached[1];
-            // syncPos still needs detection per-connection, but it's read-only
-            idsResolved = false; // still need syncPos; keepAlive is known
-            log.info("[" + botName + "] Using cached IDs: "
-                    + "KeepAlive C=0x" + Integer.toHexString(keepAliveClientboundId)
-                    + " S=0x" + Integer.toHexString(keepAliveServerboundId));
+            syncPosClientboundId   = cached[2];
+            idsResolved            = true;
+            log.info("[" + botName + "] All IDs from cache — "
+                    + "KA C=0x" + Integer.toHexString(keepAliveClientboundId)
+                    + " S=0x" + Integer.toHexString(keepAliveServerboundId)
+                    + " SyncPos=0x" + Integer.toHexString(syncPosClientboundId)
+                    + " — sniff skipped");
+        }
+
+        // Resume probe from last known-bad candidate, not from 0x01
+        probeCandidate = PROBE_CANDIDATE_CACHE.getOrDefault(cacheKey, PROBE_ID_MIN);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Protocol ID table — seeds the cache for well-known versions so the
+    // sniff/probe phase is bypassed entirely on first connect.
+    // Called from setProtocolVersion() (before login starts).
+    // ═══════════════════════════════════════════════════════════════════════
+
+    private void seedKnownIds() {
+        if (SERVER_ID_CACHE.containsKey(cacheKey)) return; // already resolved
+
+        int[] ids = knownIdsForProtocol(protocolVersion);
+        if (ids != null) {
+            SERVER_ID_CACHE.put(cacheKey, ids);
+            keepAliveClientboundId = ids[0];
+            keepAliveServerboundId = ids[1];
+            syncPosClientboundId   = ids[2];
+            idsResolved            = true;
+            log.info("[" + botName + "] Seeded known IDs for protocol " + protocolVersion
+                    + ": KA C=0x" + Integer.toHexString(ids[0])
+                    + " S=0x"  + Integer.toHexString(ids[1])
+                    + " SyncPos=0x" + Integer.toHexString(ids[2]));
         }
     }
 
-    /** Reset cached IDs for this server (called when the probed ID turns out wrong). */
+    /**
+     * Known {clientbound KeepAlive, serverbound KeepAlive, SyncPos} triplets
+     * for vanilla Paper/Spigot.
+     *
+     *   Protocol 774 = Minecraft 1.21.4
+     *   Protocol 770 = Minecraft 1.21.2 / 1.21.3
+     *   Protocol 769 = Minecraft 1.21.1
+     *   Protocol 767 = Minecraft 1.21 / 1.21.1 (initial release)
+     *   Protocol 765 = Minecraft 1.20.4
+     *   Protocol 764 = Minecraft 1.20.2
+     *   Protocol 763 = Minecraft 1.20 / 1.20.1
+     */
+    private static int[] knownIdsForProtocol(int proto) {
+        if (proto == 774) return new int[]{ 0x26, 0x18, 0x46 }; // 1.21.4
+        if (proto == 770) return new int[]{ 0x26, 0x18, 0x44 }; // 1.21.2/1.21.3
+        if (proto == 769) return new int[]{ 0x26, 0x18, 0x40 }; // 1.21.1
+        if (proto == 767) return new int[]{ 0x24, 0x18, 0x40 }; // 1.21
+        if (proto == 765) return new int[]{ 0x24, 0x18, 0x3E }; // 1.20.4
+        if (proto == 764) return new int[]{ 0x23, 0x18, 0x3C }; // 1.20.2
+        if (proto == 763) return new int[]{ 0x23, 0x17, 0x3A }; // 1.20/1.20.1
+        return null; // unknown version — fall through to sniff/probe
+    }
+
+    /** Reset cached IDs for this server (called when a probed ID turns out wrong). */
     public void invalidateCache() {
         SERVER_ID_CACHE.remove(cacheKey);
-        idsResolved = false;
+        idsResolved            = false;
         keepAliveServerboundId = -1;
-        // keepAliveClientboundId stays — we know the C ID, just not the S ID yet
+        syncPosClientboundId   = -1;
+        // keepAliveClientboundId intentionally kept — C ID is already known
     }
 
     /** Return the serverbound ID currently being probed (for BotClient to store). */
@@ -163,6 +215,7 @@ public class MinecraftProtocol {
         this.protocolVersion = v;
         log.info("[" + botName + "] Protocol " + v
                 + " — Play-state IDs will be auto-detected");
+        seedKnownIds();
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -338,7 +391,6 @@ public class MinecraftProtocol {
             if (reason != null) throw new IOException("Kicked: " + reason);
         }
 
-        // Route to sniff or normal handler
         if (idsResolved) {
             handleNormal(pkt, bot);
         } else {
@@ -347,7 +399,8 @@ public class MinecraftProtocol {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Sniff phase — auto-detect SyncPos, then probe KeepAlive serverbound ID
+    // Sniff phase
+    // (only reached when SERVER_ID_CACHE had no entry on construction)
     // ═══════════════════════════════════════════════════════════════════════
 
     private int sniffCount = 0;
@@ -371,10 +424,14 @@ public class MinecraftProtocol {
         }
 
         // ── Step 2: detect clientbound KeepAlive ──────────────────────────
+        // Only accept 8-byte packets whose ID falls in the plausible range for
+        // this protocol — prevents set_time and similar 8-byte packets from
+        // being mistaken for KeepAlive.
         if (keepAliveClientboundId == -1
                 && syncPosClientboundId != -1
                 && pkt.data.length == 8
-                && pkt.id != syncPosClientboundId) {
+                && pkt.id != syncPosClientboundId
+                && isPlausibleKeepAliveClientboundId(pkt.id)) {
 
             keepAliveClientboundId = pkt.id;
             pendingKeepAliveId     = pkt.stream().readLong();
@@ -382,63 +439,97 @@ public class MinecraftProtocol {
                     + Integer.toHexString(keepAliveClientboundId)
                     + " (sniff #" + sniffCount + ")");
 
-            // If we already have a cached / known serverbound ID, use it
             if (keepAliveServerboundId >= 0) {
+                // Serverbound ID was already known (e.g. partial cache from a
+                // previous invalidated entry).  Write full cache and resolve.
+                cacheAndResolve();
                 sendKeepAlive(pendingKeepAliveId);
-                idsResolved = true;
-                log.info("[" + botName + "] IDs resolved from cache — S=0x"
-                        + Integer.toHexString(keepAliveServerboundId));
             } else {
-                // Begin probing: advance candidate past SyncPos and TeleportConfirm
-                probeCandidate = PROBE_ID_MIN;
-                if (probeCandidate == S_CONFIRM_TELEPORT) probeCandidate++; // skip 0x00
+                // Begin probing with the persisted candidate
                 probeKeepAlive();
             }
             return;
         }
 
-        // ── Sniff window exhausted — fall back to offset heuristic ─────────
+        // ── Step 2b: waiting for second KeepAlive to confirm the probe ─────
+        if (keepAliveClientboundId >= 0
+                && keepAliveServerboundId < 0
+                && pkt.id == keepAliveClientboundId
+                && pkt.data.length == 8) {
+            confirmProbe(pkt.stream().readLong());
+            return;
+        }
+
+        // ── Step 3: Sniff window exhausted — last-resort fallback ──────────
+        // NEVER fires while a probe is active (keepAliveServerboundId still -1
+        // but keepAliveClientboundId already set).
         if (sniffCount >= SNIFF_WINDOW) {
+            if (keepAliveClientboundId >= 0 && keepAliveServerboundId < 0) {
+                // Probe in progress — extend the window, do not clobber IDs
+                return;
+            }
+
             if (keepAliveClientboundId < 0) {
-                keepAliveClientboundId = (protocolVersion >= 767) ? 0x26 : 0x24;
+                keepAliveClientboundId = fallbackClientboundKeepAliveId(protocolVersion);
             }
             if (keepAliveServerboundId < 0) {
-                keepAliveServerboundId = Math.max(1, keepAliveClientboundId - 0x0C);
+                int offset = (protocolVersion >= 764) ? 0x0E : 0x0C;
+                keepAliveServerboundId = Math.max(1, keepAliveClientboundId - offset);
                 log.warning("[" + botName + "] Sniff window exhausted, using fallback "
                         + "S=0x" + Integer.toHexString(keepAliveServerboundId));
             }
             if (syncPosClientboundId < 0) {
-                syncPosClientboundId = (protocolVersion >= 774) ? 0x48
-                        : (protocolVersion >= 768) ? 0x40 : 0x3E;
+                syncPosClientboundId = fallbackSyncPosId(protocolVersion);
             }
-            idsResolved = true;
+            cacheAndResolve();
         }
     }
 
+    /**
+     * Write all three IDs to SERVER_ID_CACHE and mark this instance as resolved.
+     * After this call every future bot for this server will skip sniffing.
+     */
+    private void cacheAndResolve() {
+        SERVER_ID_CACHE.put(cacheKey,
+                new int[]{ keepAliveClientboundId, keepAliveServerboundId, syncPosClientboundId });
+        PROBE_CANDIDATE_CACHE.remove(cacheKey);
+        idsResolved = true;
+        log.info("[" + botName + "] IDs resolved and cached — "
+                + "KA C=0x" + Integer.toHexString(keepAliveClientboundId)
+                + " S=0x"   + Integer.toHexString(keepAliveServerboundId)
+                + " SyncPos=0x" + Integer.toHexString(syncPosClientboundId)
+                + " — all future bots will skip sniffing");
+    }
+
+    /**
+     * Restrict clientbound KeepAlive detection to a plausible ID range so that
+     * other coincidentally-8-byte packets (set_time, etc.) are not misidentified.
+     */
+    private boolean isPlausibleKeepAliveClientboundId(int id) {
+        if (protocolVersion >= 770) return id >= 0x22 && id <= 0x2A;
+        if (protocolVersion >= 764) return id >= 0x1F && id <= 0x2A;
+        return id >= 0x1C && id <= 0x28;
+    }
+
+    private static int fallbackClientboundKeepAliveId(int proto) {
+        if (proto >= 770) return 0x26;
+        if (proto >= 767) return 0x26;
+        if (proto >= 764) return 0x23;
+        return 0x21;
+    }
+
+    private static int fallbackSyncPosId(int proto) {
+        if (proto >= 774) return 0x46;
+        if (proto >= 770) return 0x44;
+        if (proto >= 768) return 0x40;
+        return 0x3E;
+    }
+
     // ─────────────────────────────────────────────────────────────────────
-    // Probe phase — binary-search the correct serverbound KeepAlive ID
-    //
-    // Strategy:
-    //   We have a KeepAlive Long value the server wants echoed.
-    //   We send it with candidate IDs 0x00, 0x01, 0x02, … (skipping 0x00).
-    //   The server will:
-    //     • Decode-error-kick us if the ID maps to a packet with a different
-    //       format (most candidates).
-    //     • Accept silently if it's the correct KeepAlive ID.
-    //     • Possibly ignore it if the ID is out of range (treated as unknown).
-    //
-    //   To distinguish "accepted" from "ignored", we observe: after sending
-    //   the probe, the server keeps sending packets normally. If we receive
-    //   another KeepAlive with a NEW Long value, that means the server is
-    //   happy with our echo — we found the right ID.
-    //
-    //   If we get a decode error (IOException with "Failed to decode" or
-    //   "Received unknown packet id"), BotClient catches it, increments
-    //   probeCandidate, reconnects, and tries again.
+    // Probe phase
     // ─────────────────────────────────────────────────────────────────────
 
     private void probeKeepAlive() throws IOException {
-        // Skip IDs that would certainly be wrong structurally
         while (probeCandidate <= PROBE_ID_MAX
                 && probeCandidate == S_CONFIRM_TELEPORT) {
             probeCandidate++;
@@ -447,28 +538,15 @@ public class MinecraftProtocol {
             log.severe("[" + botName + "] Probe range exhausted! Cannot find KeepAlive ID.");
             throw new IOException("KeepAlive probe range exhausted");
         }
-
         log.info("[" + botName + "] Probing serverbound KeepAlive ID: 0x"
                 + Integer.toHexString(probeCandidate));
         sendKeepAlive(pendingKeepAliveId);
-        // We consider this probe successful when we receive the NEXT KeepAlive
-        // (see handleProbeConfirmation)
     }
 
-    /** Called from handleNormal/handleSniff after a probe when we see a second KeepAlive. */
+    /** Second clientbound KeepAlive arrived without a decode error — probe succeeded. */
     private void confirmProbe(long newKeepAliveId) throws IOException {
         keepAliveServerboundId = probeCandidate;
-        idsResolved = true;
-
-        // Cache for all future bots connecting to this server
-        SERVER_ID_CACHE.put(cacheKey, new int[]{keepAliveClientboundId, keepAliveServerboundId});
-
-        log.info("[" + botName + "] KeepAlive probe SUCCESS — "
-                + "C=0x" + Integer.toHexString(keepAliveClientboundId)
-                + " S=0x" + Integer.toHexString(keepAliveServerboundId)
-                + " — cached for future connections");
-
-        // Echo the new KeepAlive with the now-confirmed ID
+        cacheAndResolve(); // writes cache, sets idsResolved = true
         pendingKeepAliveId = newKeepAliveId;
         sendKeepAlive(pendingKeepAliveId);
     }
@@ -478,12 +556,11 @@ public class MinecraftProtocol {
     // ─────────────────────────────────────────────────────────────────────
 
     private void handleNormal(Packet pkt, BotClient bot) throws IOException {
-        // KeepAlive response
         if (pkt.id == keepAliveClientboundId && pkt.data.length == 8) {
             long id = pkt.stream().readLong();
-
             if (keepAliveServerboundId < 0) {
-                // Still probing — this second KeepAlive confirms our last probe worked
+                // Still probing (should be rare: only if cache was seeded with
+                // wrong C ID and got invalidated mid-session)
                 confirmProbe(id);
             } else {
                 sendKeepAlive(id);
@@ -492,7 +569,6 @@ public class MinecraftProtocol {
             return;
         }
 
-        // SyncPos → TeleportConfirm
         if (pkt.id == syncPosClientboundId && pkt.data.length >= 28) {
             SyncPosResult sp = trySyncPos(pkt);
             if (sp != null) {
@@ -503,8 +579,29 @@ public class MinecraftProtocol {
                 log.fine("[" + botName + "] Confirmed teleport #" + sp.teleportId);
             }
         }
-
         // Everything else: silently consumed
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Helpers
+    // ─────────────────────────────────────────────────────────────────────
+
+    private void sendKeepAlive(long id) throws IOException {
+        ByteArrayOutputStream r = new ByteArrayOutputStream();
+        writeLong(r, id);
+        sendRaw(keepAliveServerboundId < 0 ? probeCandidate : keepAliveServerboundId,
+                r.toByteArray());
+    }
+
+    /**
+     * Advance to the next probe candidate and persist it across reconnects.
+     * @return the new candidate ID
+     */
+    public int nextProbeCandidate() {
+        probeCandidate++;
+        if (probeCandidate == S_CONFIRM_TELEPORT) probeCandidate++;
+        PROBE_CANDIDATE_CACHE.put(cacheKey, probeCandidate);
+        return probeCandidate;
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -551,24 +648,6 @@ public class MinecraftProtocol {
 
     private static boolean coord(double v) {
         return !Double.isNaN(v) && !Double.isInfinite(v) && Math.abs(v) <= MAX_COORD;
-    }
-
-    // ─────────────────────────────────────────────────────────────────────
-    // Helpers
-    // ─────────────────────────────────────────────────────────────────────
-
-    private void sendKeepAlive(long id) throws IOException {
-        ByteArrayOutputStream r = new ByteArrayOutputStream();
-        writeLong(r, id);
-        sendRaw(probeCandidate >= 0 && keepAliveServerboundId < 0
-                ? probeCandidate : keepAliveServerboundId, r.toByteArray());
-    }
-
-    /** @return next probe candidate ID (to persist across reconnects) */
-    public int nextProbeCandidate() {
-        probeCandidate++;
-        if (probeCandidate == S_CONFIRM_TELEPORT) probeCandidate++; // skip 0x00
-        return probeCandidate;
     }
 
     // ═══════════════════════════════════════════════════════════════════════
