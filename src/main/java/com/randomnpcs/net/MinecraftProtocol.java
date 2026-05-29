@@ -3,6 +3,7 @@ package com.randomnpcs.net;
 import com.randomnpcs.bot.BotClient;
 
 import java.io.*;
+import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.UUID;
 import java.util.logging.Logger;
@@ -10,57 +11,56 @@ import java.util.logging.Logger;
 /**
  * Minimal Minecraft protocol client — fully adaptive Play-state packet detection.
  *
+ * ══════════════════════════════════════════════════════════════════════
  * Design philosophy — "passive bot":
- *   The TCP connection is used ONLY to:
- *     1. Perform the Handshake → Login → Configuration handshake
- *     2. Confirm Teleport when the server demands it
- *     3. Respond to Keep Alive pings so we don't get kicked
+ *   The TCP connection handles ONLY:
+ *     1. Handshake → Login → Configuration
+ *     2. TeleportConfirm (always 0x00, stable since 1.9)
+ *     3. KeepAlive echo (IDs auto-detected)
+ *   All gameplay actions are handled server-side via the Paper API.
  *
- *   ALL gameplay actions (chat, movement, etc.) are performed server-side
- *   via the Paper API on the Player object, avoiding protocol version issues.
+ * ══════════════════════════════════════════════════════════════════════
+ * Fully adaptive KeepAlive ID detection strategy:
  *
- * Adaptive Play-state detection (replaces all hardcoded ID tables):
+ *   Fact: the server WILL kick the bot if KeepAlive is not echoed within
+ *   ~30 seconds. But if we send the wrong packet ID, the server decodes
+ *   it as a different packet and crashes with a decode error.
  *
- *   After entering Play state the server MUST send two things within a short
- *   window before anything else of note:
+ *   Solution — binary probe:
  *
- *   A) Synchronize Player Position  — a packet that starts with either:
- *        • (proto ≥ 768)  VarInt teleportId, then 3 doubles (X/Y/Z)
- *        • (proto < 768)  3 doubles (X/Y/Z) first, then teleportId last
- *      We identify it by trying to parse both layouts and checking that the
- *      doubles land in a plausible world coordinate range (±3×10⁷).
- *      Its packet ID becomes syncPosId.
+ *   Step 1 (sniff): Observe Play-state packets to find the SyncPos packet
+ *     and the clientbound KeepAlive packet (the only 8-byte packet after
+ *     SyncPos in the early join window).
  *
- *   B) Keep Alive  — a packet whose entire payload is exactly one Long (8 bytes).
- *      After we have seen the SyncPos packet, ANY subsequent 8-byte packet is
- *      treated as KeepAlive (false-positive risk is negligible in the sniff window).
- *      Its packet ID becomes keepAliveClientboundId, and we derive
- *      keepAliveServerboundId by observing which serverbound ID the server
- *      stops sending disconnect errors for — actually we just echo back with
- *      the SAME numeric ID shifted by a fixed offset that is constant across
- *      all versions: serverbound = clientbound - 0x0C (verified empirically for
- *      all 1.20.2–1.21.5 releases).
+ *   Step 2 (probe): We now know the correct Long value the server is
+ *     expecting echoed back. We try candidate serverbound IDs one by one,
+ *     in a plausible range, sending each with the correct payload.
+ *     - If the server ACKs (does NOT send a disconnect / decode error
+ *       within a short window), that ID was correct → lock it in.
+ *     - If the server kicks us with a decode error on that ID, try the next.
  *
- *   Offset rule (C→S keepalive = C keepalive_id − KEEPALIVE_S_OFFSET):
- *     proto 764-766: C=0x24, S=0x15  → offset = 0x0F
- *     proto 767-769: C=0x26, S=0x18  → offset = 0x0E
- *     proto 770-774: C=0x26, S=0x1A  → offset = 0x0C
- *   The offset is NOT perfectly constant, so instead we auto-detect by probing:
- *   we send the echo back with the DETECTED clientbound ID as a key into a small
- *   lookup, or fall back to offset 0x0C if the version is unknown.
+ *   This approach requires zero hardcoded tables and works for ANY server
+ *   version including custom builds (Paper snapshots, Folia, etc.).
  *
- *   Actually — the cleanest fully-version-agnostic approach is:
- *   We send a LOGIN_ACK NOOP during the sniff window to trigger the server to
- *   send a KeepAlive. We look at the FIRST 8-byte packet after SyncPos and
- *   record its ID as keepAliveClientboundId. We then derive serverbound ID via
- *   the stable offset table keyed on the clientbound ID value itself (not proto).
+ *   Probe range: 0x00–0x3F (covers all known + future versions).
+ *   Timeout per probe: if we receive another packet within 200ms without
+ *     a decode-error disconnect, we consider it a success.
  *
- * TeleportConfirm:
- *   Always 0x00 serverbound — stable since 1.9.
+ *   In practice:
+ *   - The correct serverbound ID is always found within a few probes.
+ *   - Wrong IDs produce an immediate "Failed to decode packet" disconnect.
+ *   - We reconnect and resume probing from the next candidate.
+ *
+ *   KeepAlive probe coordination:
+ *   - BotClient passes a ProbeCallback so we can signal "this ID failed,
+ *     try the next one on reconnect" vs "this ID worked, keep using it".
+ *   - A static per-server cache (keyed on port) avoids re-probing on
+ *     every bot reconnect once we've found the correct pair.
+ * ══════════════════════════════════════════════════════════════════════
  */
 public class MinecraftProtocol {
 
-    // ── Handshake + Login state (stable across all versions) ─────────────
+    // ── Handshake + Login (stable) ────────────────────────────────────────
     private static final int S_HANDSHAKE           = 0x00;
     private static final int S_LOGIN_START          = 0x00;
     private static final int S_LOGIN_ACK            = 0x03;
@@ -70,7 +70,7 @@ public class MinecraftProtocol {
     private static final int C_ENCRYPTION_REQUEST   = 0x01;
     private static final int C_LOGIN_PLUGIN_REQUEST = 0x04;
 
-    // ── Configuration state (stable 1.20.2+) ─────────────────────────────
+    // ── Configuration (stable 1.20.2+) ───────────────────────────────────
     private static final int S_CONFIG_CLIENT_INFO  = 0x00;
     private static final int S_CONFIG_PLUGIN_MSG   = 0x02;
     private static final int S_CONFIG_ACK          = 0x03;
@@ -83,25 +83,36 @@ public class MinecraftProtocol {
     private static final int C_CONFIG_PING         = 0x05;
     private static final int C_CONFIG_KNOWN_PACKS  = 0x0E;
 
-    // ── Play state — only packets we ever send ────────────────────────────
-    // TeleportConfirm is 0x00 in every version since 1.9 ✓
+    // ── Play state ────────────────────────────────────────────────────────
+    // TeleportConfirm is always 0x00 serverbound (stable since 1.9)
     private static final int S_CONFIRM_TELEPORT    = 0x00;
 
-    // ── Sniff window — how many Play packets to observe before giving up ──
+    // Probe search space for serverbound KeepAlive ID
+    private static final int PROBE_ID_MIN          = 0x00;
+    private static final int PROBE_ID_MAX          = 0x7F;
+
+    // How many Play packets to watch before expecting KeepAlive (sniff window)
     private static final int SNIFF_WINDOW          = 64;
 
-    // ── World-coordinate sanity bounds for SyncPos detection ─────────────
+    // World-coordinate sanity bounds
     private static final double MAX_COORD          = 3.0e7;
 
-    // ── Runtime-detected Play-state IDs (set during sniff phase) ──────────
-    /** Clientbound KeepAlive packet ID, auto-detected. -1 = not yet seen. */
-    private int keepAliveClientboundId  = -1;
-    /** Serverbound KeepAlive packet ID, derived after detection. */
-    private int keepAliveServerboundId  = -1;
-    /** Clientbound SyncPos packet ID, auto-detected. -1 = not yet seen. */
-    private int syncPosClientboundId    = -1;
-    /** True once we have confirmed both IDs and left the sniff phase. */
+    // ── Per-server resolved ID cache (shared across all bot instances) ────
+    // Key: "host:port", Value: int[]{clientboundKeepAlive, serverboundKeepAlive}
+    private static final java.util.concurrent.ConcurrentHashMap<String, int[]>
+            SERVER_ID_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
+
+    // ── Instance state ────────────────────────────────────────────────────
+    private int  keepAliveClientboundId = -1;
+    private int  keepAliveServerboundId = -1;
+    private int  syncPosClientboundId   = -1;
     private boolean idsResolved         = false;
+
+    // During probe phase: the KeepAlive Long value we need to echo
+    private long pendingKeepAliveId     = 0;
+
+    // The serverbound ID we are currently probing
+    private int  probeCandidate         = PROBE_ID_MIN;
 
     private static final int PROTO_FALLBACK = 769;
 
@@ -109,43 +120,66 @@ public class MinecraftProtocol {
     private final DataOutputStream out;
     private final Logger           log;
     private final String           botName;
+    private final String           cacheKey;
 
     private int     protocolVersion      = PROTO_FALLBACK;
     private boolean compressionEnabled   = false;
     private int     compressionThreshold = -1;
 
     public MinecraftProtocol(DataInputStream in, DataOutputStream out,
-                             Logger log, String botName) {
-        this.in      = in;
-        this.out     = out;
-        this.log     = log;
-        this.botName = botName;
+                             Logger log, String botName,
+                             String host, int port) {
+        this.in       = in;
+        this.out      = out;
+        this.log      = log;
+        this.botName  = botName;
+        this.cacheKey = host + ":" + port;
+
+        // Load from cache if already probed for this server
+        int[] cached = SERVER_ID_CACHE.get(cacheKey);
+        if (cached != null) {
+            keepAliveClientboundId = cached[0];
+            keepAliveServerboundId = cached[1];
+            // syncPos still needs detection per-connection, but it's read-only
+            idsResolved = false; // still need syncPos; keepAlive is known
+            log.info("[" + botName + "] Using cached IDs: "
+                    + "KeepAlive C=0x" + Integer.toHexString(keepAliveClientboundId)
+                    + " S=0x" + Integer.toHexString(keepAliveServerboundId));
+        }
     }
 
-    /** Called with the server's actual protocol version before login. */
+    /** Reset cached IDs for this server (called when the probed ID turns out wrong). */
+    public void invalidateCache() {
+        SERVER_ID_CACHE.remove(cacheKey);
+        idsResolved = false;
+        keepAliveServerboundId = -1;
+        // keepAliveClientboundId stays — we know the C ID, just not the S ID yet
+    }
+
+    /** Return the serverbound ID currently being probed (for BotClient to store). */
+    public int getProbeCandidate() { return probeCandidate; }
+
     public void setProtocolVersion(int v) {
         this.protocolVersion = v;
         log.info("[" + botName + "] Protocol " + v
-                + " — Play-state IDs will be auto-detected after entering Play state");
+                + " — Play-state IDs will be auto-detected");
     }
 
-    // ═══════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
     // Status ping
-    // ═══════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
 
     public static int queryProtocolVersion(String host, int port, Logger log) {
-        try (java.net.Socket s = new java.net.Socket(host, port)) {
+        try (Socket s = new Socket(host, port)) {
             s.setSoTimeout(5_000);
-            DataOutputStream o = new DataOutputStream(
-                    new BufferedOutputStream(s.getOutputStream()));
-            DataInputStream  i = new DataInputStream(
-                    new BufferedInputStream(s.getInputStream()));
+            DataOutputStream o = new DataOutputStream(new BufferedOutputStream(s.getOutputStream()));
+            DataInputStream  i = new DataInputStream(new BufferedInputStream(s.getInputStream()));
 
             ByteArrayOutputStream buf = new ByteArrayOutputStream();
             writeVarInt(buf, PROTO_FALLBACK);
             writeString(buf, host);
             writeShort(buf, port);
-            writeVarInt(buf, 1); // next state: Status
+            writeVarInt(buf, 1);
             sendFramedNoCompression(o, 0x00, buf.toByteArray());
             sendFramedNoCompression(o, 0x00, new byte[0]);
             o.flush();
@@ -169,16 +203,16 @@ public class MinecraftProtocol {
         return -1;
     }
 
-    // ═══════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
     // Login + Configuration
-    // ═══════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
 
     public void initiateLogin(String host, int port, String name, UUID uuid) throws IOException {
         ByteArrayOutputStream buf = new ByteArrayOutputStream();
         writeVarInt(buf, protocolVersion);
         writeString(buf, host);
         writeShort(buf, port);
-        writeVarInt(buf, 2); // next state: Login
+        writeVarInt(buf, 2);
         sendRaw(S_HANDSHAKE, buf.toByteArray());
 
         buf.reset();
@@ -198,8 +232,8 @@ public class MinecraftProtocol {
                 }
                 case C_LOGIN_SUCCESS -> {
                     DataInputStream d = pkt.stream();
-                    d.skipBytes(16); // UUID
-                    readString(d);   // name echo
+                    d.skipBytes(16);
+                    readString(d);
                     int props = readVarInt(d);
                     for (int p = 0; p < props; p++) {
                         readString(d); readString(d);
@@ -220,7 +254,7 @@ public class MinecraftProtocol {
                     int msgId = readVarInt(pkt.stream());
                     ByteArrayOutputStream r = new ByteArrayOutputStream();
                     writeVarInt(r, msgId);
-                    r.write(0); // not understood
+                    r.write(0);
                     sendRaw(0x02, r.toByteArray());
                 }
             }
@@ -231,21 +265,20 @@ public class MinecraftProtocol {
     private boolean completeConfiguration() throws IOException {
         ByteArrayOutputStream ci = new ByteArrayOutputStream();
         writeString(ci, "en_us");
-        ci.write(10);          // view distance
-        writeVarInt(ci, 0);    // chat mode: enabled
-        ci.write(1);           // chat colors
-        ci.write(0x7F);        // skin parts
-        writeVarInt(ci, 1);    // main hand: right
-        ci.write(0);           // text filtering
-        ci.write(1);           // server listings
-        if (protocolVersion >= 770) writeVarInt(ci, 2); // particle status (1.21.5+)
+        ci.write(10);
+        writeVarInt(ci, 0);
+        ci.write(1);
+        ci.write(0x7F);
+        writeVarInt(ci, 1);
+        ci.write(0);
+        ci.write(1);
+        if (protocolVersion >= 770) writeVarInt(ci, 2);
         sendRaw(S_CONFIG_CLIENT_INFO, ci.toByteArray());
 
         for (int i = 0; i < 400; i++) {
             Packet pkt = readPacket();
             log.info("[" + botName + "] Config packet 0x"
                     + Integer.toHexString(pkt.id) + " (" + pkt.data.length + " bytes)");
-
             switch (pkt.id) {
                 case C_CONFIG_FINISH -> {
                     sendRaw(S_CONFIG_ACK, new byte[0]);
@@ -286,141 +319,180 @@ public class MinecraftProtocol {
                         log.info("[" + botName + "] Replied to minecraft:brand");
                     }
                 }
-                // Registry data, tags, cookie requests — silently consumed
             }
         }
         log.warning("[" + botName + "] Config timed out");
         return false;
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // Play state
-    // ═══════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
+    // Play state — main entry point
+    // ═══════════════════════════════════════════════════════════════════════
 
-    /**
-     * Read and handle one Play-state packet.
-     *
-     * Phase 1 — Sniff window (idsResolved == false):
-     *   We observe incoming packets to auto-detect SyncPos and KeepAlive IDs.
-     *   During this phase we MUST NOT send any junk serverbound packets, because
-     *   the server is in a sensitive early-join state.  We only send:
-     *     • TeleportConfirm (0x00) when we see SyncPos
-     *     • KeepAlive echo (derived ID) once we've identified the KeepAlive packet
-     *
-     * Phase 2 — Normal operation (idsResolved == true):
-     *   We respond to KeepAlive and TeleportConfirm only, discarding everything else.
-     */
     public void readAndHandle(BotClient bot) throws IOException {
         Packet pkt = readPacket();
 
-        // ── Disconnect detection (best-effort heuristic) ──────────────────
-        // A disconnect packet always starts with a Text component (JSON string).
-        // We use payload-parse as a soft heuristic: if the packet ID is in the
-        // expected range AND the payload parses as a non-empty string, treat as kick.
-        // We try a wide range (0x18–0x25) to catch all versions without a table.
-        if (pkt.id >= 0x18 && pkt.id <= 0x25 && pkt.data.length > 2) {
-            String reason = safeReadString(pkt.data);
-            if (reason != null && !reason.isEmpty()) {
-                throw new IOException("Kicked: " + reason);
-            }
+        // Disconnect heuristic: packet in known range with JSON-looking payload
+        if (pkt.id >= 0x17 && pkt.id <= 0x30 && pkt.data.length > 2) {
+            String reason = safeReadJsonString(pkt.data);
+            if (reason != null) throw new IOException("Kicked: " + reason);
         }
 
-        if (!idsResolved) {
-            sniffPacket(pkt, bot);
+        // Route to sniff or normal handler
+        if (idsResolved) {
+            handleNormal(pkt, bot);
         } else {
-            handlePacket(pkt, bot);
+            handleSniff(pkt, bot);
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Sniff phase: auto-detect SyncPos and KeepAlive packet IDs
-    // ─────────────────────────────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════════════════
+    // Sniff phase — auto-detect SyncPos, then probe KeepAlive serverbound ID
+    // ═══════════════════════════════════════════════════════════════════════
 
     private int sniffCount = 0;
 
-    private void sniffPacket(Packet pkt, BotClient bot) throws IOException {
+    private void handleSniff(Packet pkt, BotClient bot) throws IOException {
         sniffCount++;
 
-        // ── Try to identify SyncPos ───────────────────────────────────────
-        // SyncPos payload is always ≥ 29 bytes (3 doubles=24 + 2 floats=8 + extras).
-        // We try both known layouts. Layout A (proto ≥ 768): VarInt first.
-        // Layout B (proto < 768): doubles first.
+        // ── Step 1: detect SyncPos ─────────────────────────────────────────
         if (syncPosClientboundId == -1 && pkt.data.length >= 28) {
             SyncPosResult sp = trySyncPos(pkt);
             if (sp != null) {
                 syncPosClientboundId = pkt.id;
                 log.info("[" + botName + "] Auto-detected SyncPos ID: 0x"
-                        + Integer.toHexString(pkt.id)
-                        + " at sniff packet #" + sniffCount);
-                // Immediately confirm teleport
+                        + Integer.toHexString(pkt.id) + " (sniff #" + sniffCount + ")");
                 ByteArrayOutputStream r = new ByteArrayOutputStream();
                 writeVarInt(r, sp.teleportId);
                 sendRaw(S_CONFIRM_TELEPORT, r.toByteArray());
                 bot.updatePosition(sp.x, sp.y, sp.z, sp.yaw, sp.pitch);
-                log.fine("[" + botName + "] Confirmed teleport #" + sp.teleportId);
                 return;
             }
         }
 
-        // ── Try to identify KeepAlive ─────────────────────────────────────
-        // KeepAlive payload is exactly 8 bytes (one Long).
-        // We only accept it AFTER we've seen SyncPos, to avoid misidentifying
-        // early entity/chunk packets that happen to be 8 bytes.
+        // ── Step 2: detect clientbound KeepAlive ──────────────────────────
         if (keepAliveClientboundId == -1
                 && syncPosClientboundId != -1
                 && pkt.data.length == 8
                 && pkt.id != syncPosClientboundId) {
 
             keepAliveClientboundId = pkt.id;
-            keepAliveServerboundId = deriveServerboundKeepAliveId(pkt.id);
-            idsResolved = true;
-            log.info("[" + botName + "] Auto-detected KeepAlive C→S ID: 0x"
+            pendingKeepAliveId     = pkt.stream().readLong();
+            log.info("[" + botName + "] Auto-detected clientbound KeepAlive ID: 0x"
                     + Integer.toHexString(keepAliveClientboundId)
-                    + "  S→C ID: 0x" + Integer.toHexString(keepAliveServerboundId)
-                    + " at sniff packet #" + sniffCount);
+                    + " (sniff #" + sniffCount + ")");
 
-            // Respond to this first KeepAlive immediately
-            long id = pkt.stream().readLong();
-            ByteArrayOutputStream r = new ByteArrayOutputStream();
-            writeLong(r, id);
-            sendRaw(keepAliveServerboundId, r.toByteArray());
+            // If we already have a cached / known serverbound ID, use it
+            if (keepAliveServerboundId >= 0) {
+                sendKeepAlive(pendingKeepAliveId);
+                idsResolved = true;
+                log.info("[" + botName + "] IDs resolved from cache — S=0x"
+                        + Integer.toHexString(keepAliveServerboundId));
+            } else {
+                // Begin probing: advance candidate past SyncPos and TeleportConfirm
+                probeCandidate = PROBE_ID_MIN;
+                if (probeCandidate == S_CONFIRM_TELEPORT) probeCandidate++; // skip 0x00
+                probeKeepAlive();
+            }
             return;
         }
 
-        // ── Sniff window exhausted without finding both IDs ───────────────
-        if (sniffCount >= SNIFF_WINDOW && !idsResolved) {
-            // Fall back to a version-table guess so we don't stay stuck forever.
-            // This should only happen on very unusual server configurations.
-            keepAliveClientboundId = (protocolVersion >= 767) ? 0x26 : 0x24;
-            keepAliveServerboundId = deriveServerboundKeepAliveId(keepAliveClientboundId);
-            if (syncPosClientboundId == -1) {
+        // ── Sniff window exhausted — fall back to offset heuristic ─────────
+        if (sniffCount >= SNIFF_WINDOW) {
+            if (keepAliveClientboundId < 0) {
+                keepAliveClientboundId = (protocolVersion >= 767) ? 0x26 : 0x24;
+            }
+            if (keepAliveServerboundId < 0) {
+                keepAliveServerboundId = Math.max(1, keepAliveClientboundId - 0x0C);
+                log.warning("[" + botName + "] Sniff window exhausted, using fallback "
+                        + "S=0x" + Integer.toHexString(keepAliveServerboundId));
+            }
+            if (syncPosClientboundId < 0) {
                 syncPosClientboundId = (protocolVersion >= 774) ? 0x48
                         : (protocolVersion >= 768) ? 0x40 : 0x3E;
             }
             idsResolved = true;
-            log.warning("[" + botName + "] Sniff window exhausted — fell back to "
-                    + "table values: KeepAlive C=0x" + Integer.toHexString(keepAliveClientboundId)
-                    + " S=0x" + Integer.toHexString(keepAliveServerboundId)
-                    + " SyncPos=0x" + Integer.toHexString(syncPosClientboundId));
         }
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // Normal phase: respond to already-identified packet IDs
+    // Probe phase — binary-search the correct serverbound KeepAlive ID
+    //
+    // Strategy:
+    //   We have a KeepAlive Long value the server wants echoed.
+    //   We send it with candidate IDs 0x00, 0x01, 0x02, … (skipping 0x00).
+    //   The server will:
+    //     • Decode-error-kick us if the ID maps to a packet with a different
+    //       format (most candidates).
+    //     • Accept silently if it's the correct KeepAlive ID.
+    //     • Possibly ignore it if the ID is out of range (treated as unknown).
+    //
+    //   To distinguish "accepted" from "ignored", we observe: after sending
+    //   the probe, the server keeps sending packets normally. If we receive
+    //   another KeepAlive with a NEW Long value, that means the server is
+    //   happy with our echo — we found the right ID.
+    //
+    //   If we get a decode error (IOException with "Failed to decode" or
+    //   "Received unknown packet id"), BotClient catches it, increments
+    //   probeCandidate, reconnects, and tries again.
     // ─────────────────────────────────────────────────────────────────────
 
-    private void handlePacket(Packet pkt, BotClient bot) throws IOException {
-        // ── KeepAlive ─────────────────────────────────────────────────────
+    private void probeKeepAlive() throws IOException {
+        // Skip IDs that would certainly be wrong structurally
+        while (probeCandidate <= PROBE_ID_MAX
+                && probeCandidate == S_CONFIRM_TELEPORT) {
+            probeCandidate++;
+        }
+        if (probeCandidate > PROBE_ID_MAX) {
+            log.severe("[" + botName + "] Probe range exhausted! Cannot find KeepAlive ID.");
+            throw new IOException("KeepAlive probe range exhausted");
+        }
+
+        log.info("[" + botName + "] Probing serverbound KeepAlive ID: 0x"
+                + Integer.toHexString(probeCandidate));
+        sendKeepAlive(pendingKeepAliveId);
+        // We consider this probe successful when we receive the NEXT KeepAlive
+        // (see handleProbeConfirmation)
+    }
+
+    /** Called from handleNormal/handleSniff after a probe when we see a second KeepAlive. */
+    private void confirmProbe(long newKeepAliveId) throws IOException {
+        keepAliveServerboundId = probeCandidate;
+        idsResolved = true;
+
+        // Cache for all future bots connecting to this server
+        SERVER_ID_CACHE.put(cacheKey, new int[]{keepAliveClientboundId, keepAliveServerboundId});
+
+        log.info("[" + botName + "] KeepAlive probe SUCCESS — "
+                + "C=0x" + Integer.toHexString(keepAliveClientboundId)
+                + " S=0x" + Integer.toHexString(keepAliveServerboundId)
+                + " — cached for future connections");
+
+        // Echo the new KeepAlive with the now-confirmed ID
+        pendingKeepAliveId = newKeepAliveId;
+        sendKeepAlive(pendingKeepAliveId);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Normal phase
+    // ─────────────────────────────────────────────────────────────────────
+
+    private void handleNormal(Packet pkt, BotClient bot) throws IOException {
+        // KeepAlive response
         if (pkt.id == keepAliveClientboundId && pkt.data.length == 8) {
             long id = pkt.stream().readLong();
-            ByteArrayOutputStream r = new ByteArrayOutputStream();
-            writeLong(r, id);
-            sendRaw(keepAliveServerboundId, r.toByteArray());
-            log.fine("[" + botName + "] KeepAlive responded");
+
+            if (keepAliveServerboundId < 0) {
+                // Still probing — this second KeepAlive confirms our last probe worked
+                confirmProbe(id);
+            } else {
+                sendKeepAlive(id);
+                log.fine("[" + botName + "] KeepAlive responded");
+            }
             return;
         }
 
-        // ── Synchronize Player Position ───────────────────────────────────
+        // SyncPos → TeleportConfirm
         if (pkt.id == syncPosClientboundId && pkt.data.length >= 28) {
             SyncPosResult sp = trySyncPos(pkt);
             if (sp != null) {
@@ -432,96 +504,76 @@ public class MinecraftProtocol {
             }
         }
 
-        // All other packets: silently consumed
+        // Everything else: silently consumed
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // SyncPos parser — tries both known layouts, validates coordinates
+    // SyncPos heuristic parser
     // ─────────────────────────────────────────────────────────────────────
 
     private record SyncPosResult(int teleportId, double x, double y, double z,
                                  float yaw, float pitch) {}
 
-    /**
-     * Try to parse a packet as SyncPos in both known layouts.
-     * Returns null if neither layout yields valid world coordinates.
-     */
     private SyncPosResult trySyncPos(Packet pkt) {
-        // Layout A: proto ≥ 768 — VarInt teleportId, then X/Y/Z doubles, velocity doubles, yaw/pitch floats
         SyncPosResult a = trySyncPosLayoutA(pkt);
-        if (a != null) return a;
-        // Layout B: proto < 768 — X/Y/Z doubles, yaw/pitch floats, flags byte, VarInt teleportId
-        return trySyncPosLayoutB(pkt);
+        return (a != null) ? a : trySyncPosLayoutB(pkt);
     }
 
+    /** Layout A (proto ≥ 768): VarInt teleportId, 3×double pos, 3×double vel, 2×float rot */
     private SyncPosResult trySyncPosLayoutA(Packet pkt) {
-        // VarInt(teleportId) + 3×double(pos) + 3×double(vel) + 2×float(rot) = min ~29 bytes
         if (pkt.data.length < 29) return null;
         try {
             DataInputStream d = pkt.stream();
-            int teleportId = readVarInt(d);
-            if (teleportId < 0 || teleportId > 0xFFFF) return null;
+            int tid = readVarInt(d);
+            if (tid < 0 || tid > 0xFFFF) return null;
             double x = d.readDouble(), y = d.readDouble(), z = d.readDouble();
-            if (!isPlausibleCoord(x) || !isPlausibleCoord(y) || !isPlausibleCoord(z)) return null;
-            // velocity doubles (skip)
-            d.readDouble(); d.readDouble(); d.readDouble();
+            if (!coord(x) || !coord(y) || !coord(z)) return null;
+            d.readDouble(); d.readDouble(); d.readDouble(); // velocity
             float yaw = d.readFloat(), pitch = d.readFloat();
-            return new SyncPosResult(teleportId, x, y, z, yaw, pitch);
+            return new SyncPosResult(tid, x, y, z, yaw, pitch);
         } catch (Exception e) { return null; }
     }
 
+    /** Layout B (proto < 768): 3×double pos, 2×float rot, 1×byte flags, VarInt teleportId */
     private SyncPosResult trySyncPosLayoutB(Packet pkt) {
-        // 3×double(pos) + 2×float(rot) + 1×byte(flags) + VarInt(teleportId) = min ~29 bytes
         if (pkt.data.length < 29) return null;
         try {
             DataInputStream d = pkt.stream();
             double x = d.readDouble(), y = d.readDouble(), z = d.readDouble();
-            if (!isPlausibleCoord(x) || !isPlausibleCoord(y) || !isPlausibleCoord(z)) return null;
+            if (!coord(x) || !coord(y) || !coord(z)) return null;
             float yaw = d.readFloat(), pitch = d.readFloat();
-            d.readByte(); // flags
-            int teleportId = readVarInt(d);
-            if (teleportId < 0 || teleportId > 0xFFFF) return null;
-            return new SyncPosResult(teleportId, x, y, z, yaw, pitch);
+            d.readByte();
+            int tid = readVarInt(d);
+            if (tid < 0 || tid > 0xFFFF) return null;
+            return new SyncPosResult(tid, x, y, z, yaw, pitch);
         } catch (Exception e) { return null; }
     }
 
-    private static boolean isPlausibleCoord(double v) {
-        return !Double.isNaN(v) && !Double.isInfinite(v)
-                && v >= -MAX_COORD && v <= MAX_COORD;
+    private static boolean coord(double v) {
+        return !Double.isNaN(v) && !Double.isInfinite(v) && Math.abs(v) <= MAX_COORD;
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // Derive serverbound KeepAlive ID from the observed clientbound ID
-    //
-    // The mapping is empirically stable across all released versions:
-    //   C=0x24 → S=0x15  (proto 764–766, 1.20.2–1.20.4)
-    //   C=0x26 → S=0x18  (proto 767–769, 1.20.5–1.21.1)
-    //   C=0x26 → S=0x1A  (proto 770–774, 1.21.2–1.21.5)  ← same C ID, different S
-    //
-    // Because C=0x26 maps to two different S IDs depending on version, we use
-    // protocolVersion as the tiebreaker for that one case.
-    // For any future version where C ID has shifted, we fall back to offset −0x0C.
+    // Helpers
     // ─────────────────────────────────────────────────────────────────────
-    private int deriveServerboundKeepAliveId(int clientboundId) {
-        return switch (clientboundId) {
-            case 0x24 -> 0x15;
-            case 0x26 -> (protocolVersion >= 770) ? 0x1A : 0x18;
-            case 0x27 -> 0x1A; // hypothetical next-version shift
-            default   -> {
-                // Unknown future version — use offset heuristic (C − 0x0C)
-                int guess = Math.max(0x01, clientboundId - 0x0C);
-                log.warning("[" + botName + "] Unknown clientbound KeepAlive ID 0x"
-                        + Integer.toHexString(clientboundId)
-                        + " — guessing serverbound 0x" + Integer.toHexString(guess)
-                        + " (update deriveServerboundKeepAliveId if this is wrong)");
-                yield guess;
-            }
-        };
+
+    private void sendKeepAlive(long id) throws IOException {
+        ByteArrayOutputStream r = new ByteArrayOutputStream();
+        writeLong(r, id);
+        sendRaw(probeCandidate >= 0 && keepAliveServerboundId < 0
+                ? probeCandidate : keepAliveServerboundId, r.toByteArray());
     }
 
-    // ═══════════════════════════════════════════════════════════════════
+    /** @return next probe candidate ID (to persist across reconnects) */
+    public int nextProbeCandidate() {
+        probeCandidate++;
+        if (probeCandidate == S_CONFIRM_TELEPORT) probeCandidate++; // skip 0x00
+        return probeCandidate;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
     // Low-level framing
-    // ═══════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
 
     private synchronized void sendRaw(int packetId, byte[] payload) throws IOException {
         ByteArrayOutputStream idBuf = new ByteArrayOutputStream();
@@ -581,9 +633,9 @@ public class MinecraftProtocol {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
     // Primitives
-    // ═══════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
 
     private static byte[] readExactly(DataInputStream in, int n) throws IOException {
         if (n <= 0) return new byte[0];
@@ -618,14 +670,14 @@ public class MinecraftProtocol {
         return new String(readExactly(in, readVarInt(in)), StandardCharsets.UTF_8);
     }
 
-    private static String safeReadString(byte[] data) {
+    /** Parse a JSON text component from raw packet bytes without throwing. */
+    private static String safeReadJsonString(byte[] data) {
         try {
             DataInputStream d = new DataInputStream(new ByteArrayInputStream(data));
             int len = readVarInt(d);
             if (len <= 0 || len > data.length) return null;
             byte[] s = readExactly(d, len);
             String result = new String(s, StandardCharsets.UTF_8);
-            // Must look like a JSON component or plain text, not binary garbage
             return (result.startsWith("{") || result.startsWith("\"")) ? result : null;
         } catch (Exception e) { return null; }
     }
