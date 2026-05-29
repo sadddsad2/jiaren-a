@@ -78,6 +78,38 @@ public class BotManager {
         Bukkit.getScheduler().runTaskLaterAsynchronously(plugin, this::connectNewBot, respawnDelay);
     }
 
+
+    /**
+     * Called when a bot's KeepAlive probe was rejected by the server.
+     * Reconnects immediately with the next candidate ID, without respawn delay.
+     * Same name is reused so the probe state in MinecraftProtocol's static cache carries over.
+     */
+    public void onBotProbeReconnect(String botName) {
+        activeBots.remove(botName);
+        // Keep name in usedNames — we reuse the same name intentionally
+
+        if (!running) return;
+
+        // 1-tick delay to let the socket fully close
+        Bukkit.getScheduler().runTaskLaterAsynchronously(plugin, () -> {
+            if (!running) return;
+            String host = plugin.getServerHost();
+            int port    = plugin.getServerPort();
+            plugin.getLogger().info("Probe reconnect: " + botName + " -> " + host + ":" + port);
+
+            BotClient bot = new BotClient(plugin, this, botName, host, port);
+            activeBots.put(botName, bot);
+            try {
+                bot.connect();
+            } catch (Exception e) {
+                plugin.getLogger().warning("Probe reconnect failed for " + botName + ": " + e.getMessage());
+                activeBots.remove(botName);
+                usedNames.remove(botName);
+                onBotDied(botName);
+            }
+        }, 1L);
+    }
+
     /**
      * Connect a single new bot with a random unused name.
      */
