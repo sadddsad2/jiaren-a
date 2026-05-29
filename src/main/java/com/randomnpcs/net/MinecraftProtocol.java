@@ -142,11 +142,7 @@ public class MinecraftProtocol {
             keepAliveServerboundId = cached[1];
             syncPosClientboundId   = cached[2];
             idsResolved            = true;
-            log.info("[" + botName + "] All IDs from cache — "
-                    + "KA C=0x" + Integer.toHexString(keepAliveClientboundId)
-                    + " S=0x" + Integer.toHexString(keepAliveServerboundId)
-                    + " SyncPos=0x" + Integer.toHexString(syncPosClientboundId)
-                    + " — sniff skipped");
+            log.fine("[" + botName + "] IDs from cache — sniff skipped");
         }
 
         // Resume probe from last known-bad candidate, not from 0x01
@@ -169,10 +165,7 @@ public class MinecraftProtocol {
             keepAliveServerboundId = ids[1];
             syncPosClientboundId   = ids[2];
             idsResolved            = true;
-            log.info("[" + botName + "] Seeded known IDs for protocol " + protocolVersion
-                    + ": KA C=0x" + Integer.toHexString(ids[0])
-                    + " S=0x"  + Integer.toHexString(ids[1])
-                    + " SyncPos=0x" + Integer.toHexString(ids[2]));
+            log.fine("[" + botName + "] Seeded known IDs for protocol " + protocolVersion);
         }
     }
 
@@ -213,8 +206,7 @@ public class MinecraftProtocol {
 
     public void setProtocolVersion(int v) {
         this.protocolVersion = v;
-        log.info("[" + botName + "] Protocol " + v
-                + " — Play-state IDs will be auto-detected");
+        log.fine("[" + botName + "] Protocol version: " + v);
         seedKnownIds();
     }
 
@@ -247,11 +239,11 @@ public class MinecraftProtocol {
                     .compile("\"protocol\"\\s*:\\s*(-?\\d+)").matcher(json);
             if (m.find()) {
                 int proto = Integer.parseInt(m.group(1));
-                log.info("[StatusPing] Server protocol version: " + proto);
+                log.fine("[StatusPing] Server protocol: " + proto);
                 return proto;
             }
         } catch (Exception e) {
-            log.warning("[StatusPing] Failed: " + e.getMessage());
+            log.fine("[StatusPing] Failed: " + e.getMessage());
         }
         return -1;
     }
@@ -330,12 +322,11 @@ public class MinecraftProtocol {
 
         for (int i = 0; i < 400; i++) {
             Packet pkt = readPacket();
-            log.info("[" + botName + "] Config packet 0x"
-                    + Integer.toHexString(pkt.id) + " (" + pkt.data.length + " bytes)");
+            log.fine("[" + botName + "] Config pkt 0x" + Integer.toHexString(pkt.id));
             switch (pkt.id) {
                 case C_CONFIG_FINISH -> {
                     sendRaw(S_CONFIG_ACK, new byte[0]);
-                    log.info("[" + botName + "] Configuration complete, entering Play state");
+                    log.fine("[" + botName + "] Configuration complete");
                     return true;
                 }
                 case C_CONFIG_KEEPALIVE -> {
@@ -359,7 +350,7 @@ public class MinecraftProtocol {
                     ByteArrayOutputStream r = new ByteArrayOutputStream();
                     writeVarInt(r, 0);
                     sendRaw(S_CONFIG_KNOWN_PACKS, r.toByteArray());
-                    log.info("[" + botName + "] Replied to Select Known Packs");
+                    log.fine("[" + botName + "] Replied to Select Known Packs");
                 }
                 case C_CONFIG_PLUGIN_MSG -> {
                     DataInputStream d = pkt.stream();
@@ -369,7 +360,7 @@ public class MinecraftProtocol {
                         writeString(r, "minecraft:brand");
                         writeString(r, "vanilla");
                         sendRaw(S_CONFIG_PLUGIN_MSG, r.toByteArray());
-                        log.info("[" + botName + "] Replied to minecraft:brand");
+                        log.fine("[" + botName + "] Replied to minecraft:brand");
                     }
                 }
             }
@@ -413,8 +404,7 @@ public class MinecraftProtocol {
             SyncPosResult sp = trySyncPos(pkt);
             if (sp != null) {
                 syncPosClientboundId = pkt.id;
-                log.info("[" + botName + "] Auto-detected SyncPos ID: 0x"
-                        + Integer.toHexString(pkt.id) + " (sniff #" + sniffCount + ")");
+                log.fine("[" + botName + "] SyncPos detected: 0x" + Integer.toHexString(pkt.id));
                 ByteArrayOutputStream r = new ByteArrayOutputStream();
                 writeVarInt(r, sp.teleportId);
                 sendRaw(S_CONFIRM_TELEPORT, r.toByteArray());
@@ -435,9 +425,8 @@ public class MinecraftProtocol {
 
             keepAliveClientboundId = pkt.id;
             pendingKeepAliveId     = pkt.stream().readLong();
-            log.info("[" + botName + "] Auto-detected clientbound KeepAlive ID: 0x"
-                    + Integer.toHexString(keepAliveClientboundId)
-                    + " (sniff #" + sniffCount + ")");
+            log.fine("[" + botName + "] KeepAlive C ID detected: 0x"
+                    + Integer.toHexString(keepAliveClientboundId));
 
             if (keepAliveServerboundId >= 0) {
                 // Serverbound ID was already known (e.g. partial cache from a
@@ -475,7 +464,7 @@ public class MinecraftProtocol {
             if (keepAliveServerboundId < 0) {
                 int offset = (protocolVersion >= 764) ? 0x0E : 0x0C;
                 keepAliveServerboundId = Math.max(1, keepAliveClientboundId - offset);
-                log.warning("[" + botName + "] Sniff window exhausted, using fallback "
+                log.fine("[" + botName + "] Sniff window exhausted, using fallback "
                         + "S=0x" + Integer.toHexString(keepAliveServerboundId));
             }
             if (syncPosClientboundId < 0) {
@@ -494,11 +483,7 @@ public class MinecraftProtocol {
                 new int[]{ keepAliveClientboundId, keepAliveServerboundId, syncPosClientboundId });
         PROBE_CANDIDATE_CACHE.remove(cacheKey);
         idsResolved = true;
-        log.info("[" + botName + "] IDs resolved and cached — "
-                + "KA C=0x" + Integer.toHexString(keepAliveClientboundId)
-                + " S=0x"   + Integer.toHexString(keepAliveServerboundId)
-                + " SyncPos=0x" + Integer.toHexString(syncPosClientboundId)
-                + " — all future bots will skip sniffing");
+        log.fine("[" + botName + "] IDs resolved and cached");
     }
 
     /**
@@ -538,7 +523,7 @@ public class MinecraftProtocol {
             log.severe("[" + botName + "] Probe range exhausted! Cannot find KeepAlive ID.");
             throw new IOException("KeepAlive probe range exhausted");
         }
-        log.info("[" + botName + "] Probing serverbound KeepAlive ID: 0x"
+        log.fine("[" + botName + "] Probing KeepAlive SB ID: 0x"
                 + Integer.toHexString(probeCandidate));
         sendKeepAlive(pendingKeepAliveId);
     }
