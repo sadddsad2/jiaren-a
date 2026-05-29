@@ -11,8 +11,6 @@ import java.io.*;
 import java.net.Socket;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
 
 /**
  * One fake-player bot.
@@ -20,12 +18,12 @@ import java.util.concurrent.TimeUnit;
  * TCP connection: handles ONLY KeepAlive + Confirm Teleport (passive).
  * Chat + actions: executed via Paper API on the server-side Player object.
  *
- * connect() blocks until login succeeds or fails, returning a boolean.
- * BotManager uses this to stagger bots: wait for one to finish before
- * starting the next.
+ * Successful connection config (host:port → protocol version) is stored in a
+ * static cache so subsequent bots skip the protocol query entirely.
  *
- * All protocol IDs are auto-detected on the first connection to a server,
- * then cached for all subsequent bots.
+ * Chat messages are generated dynamically: bots pick a random topic category
+ * each time and produce a varied, natural-sounding line, optionally mentioning
+ * another online bot by name to simulate player interaction.
  */
 public class BotClient {
 
@@ -51,11 +49,17 @@ public class BotClient {
     private float  yaw, pitch;
 
     // ── Static cache: successful protocol version per server ──────────────
+    // Key: "host:port"  Value: protocol version int
     private static final ConcurrentHashMap<String, Integer> PROTO_CACHE =
             new ConcurrentHashMap<>();
 
     // ── Chat topic engine ─────────────────────────────────────────────────
+    // Each topic is a list of message templates.
+    // {other} is replaced by a random online player/bot name when available.
     private static final List<List<String>> TOPIC_POOL = buildTopicPool();
+
+    // Per-bot recently-used topic indices (avoid repeating the same category
+    // too many times in a row)
     private final Deque<Integer> recentTopics = new ArrayDeque<>();
     private static final int RECENT_TOPIC_MEMORY = 4;
 
@@ -70,11 +74,10 @@ public class BotClient {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Connect — BLOCKS until login succeeds or fails
-    // Returns true if the bot is now fully connected and in Play state.
+    // Connect
     // ═══════════════════════════════════════════════════════════════════════
 
-    public boolean connect() throws IOException {
+    public void connect() throws IOException {
         socket = new Socket(host, port);
         socket.setTcpNoDelay(true);
         socket.setSoTimeout(60_000);
@@ -92,16 +95,13 @@ public class BotClient {
             proto.setProtocolVersion(cachedProto);
             plugin.getLogger().fine("[" + name + "] Using cached protocol: " + cachedProto);
         } else {
-            int detectedProto = MinecraftProtocol.queryProtocolVersion(
-                    host, port, plugin.getLogger());
+            int detectedProto = MinecraftProtocol.queryProtocolVersion(host, port, plugin.getLogger());
             if (detectedProto > 0) {
                 proto.setProtocolVersion(detectedProto);
                 PROTO_CACHE.put(cacheKey, detectedProto);
-                plugin.getLogger().fine("[" + name + "] Protocol "
-                        + detectedProto + " cached");
+                plugin.getLogger().fine("[" + name + "] Protocol " + detectedProto + " cached");
             } else {
-                plugin.getLogger().fine("[" + name
-                        + "] Could not detect protocol, using fallback");
+                plugin.getLogger().fine("[" + name + "] Could not detect protocol, using fallback");
             }
         }
 
@@ -112,20 +112,22 @@ public class BotClient {
             throw new IOException("Login rejected for: " + name);
         }
 
+
         connected = true;
         plugin.getLogger().info(name + " joined the game");
 
         startReaderThread();
+        
+        // 【关键改动】假人成功进服，通知 Manager 队列可以推进下一个了
+        manager.onBotLoginSuccess(name); 
+
         Bukkit.getScheduler().runTaskLaterAsynchronously(plugin, () -> {
             if (connected && alive) {
                 scheduleChatTask();
                 scheduleActionTask();
             }
         }, 60L);
-
-        return true;
     }
-
     // ═══════════════════════════════════════════════════════════════════════
     // Reader thread
     // ═══════════════════════════════════════════════════════════════════════
@@ -147,8 +149,7 @@ public class BotClient {
                     int nextId = proto.nextProbeCandidate();
                     plugin.getLogger().fine("[" + name + "] Probe 0x"
                             + Integer.toHexString(proto.getProbeCandidate() - 1)
-                            + " rejected -> trying 0x"
-                            + Integer.toHexString(nextId));
+                            + " rejected → trying 0x" + Integer.toHexString(nextId));
                     probeFailedReconnect = true;
 
                 } else {
@@ -197,6 +198,7 @@ public class BotClient {
     // ── Chat ──────────────────────────────────────────────────────────────
 
     private void sendChatViaApi() {
+        // Config messages take priority if present; otherwise use dynamic topics
         List<String> configMessages = plugin.getConfig().getStringList("chat-messages");
         String msg;
         if (!configMessages.isEmpty()) {
@@ -217,7 +219,12 @@ public class BotClient {
         });
     }
 
+    /**
+     * Pick a topic category (avoiding recent repeats) and return a message.
+     * Optionally addresses another online player by name.
+     */
     private String generateChatMessage() {
+        // Choose a topic index not used recently
         int topicIdx;
         int attempts = 0;
         do {
@@ -231,6 +238,7 @@ public class BotClient {
         List<String> lines = TOPIC_POOL.get(topicIdx);
         String line = lines.get(random.nextInt(lines.size()));
 
+        // Replace {other} with a random online player name (not self)
         if (line.contains("{other}")) {
             String other = pickOtherPlayerName();
             line = line.replace("{other}", other);
@@ -238,6 +246,7 @@ public class BotClient {
         return line;
     }
 
+    /** Pick another online player's name, falling back to a generic "大家" */
     private String pickOtherPlayerName() {
         List<String> others = new ArrayList<>();
         for (Player p : Bukkit.getOnlinePlayers()) {
@@ -277,10 +286,8 @@ public class BotClient {
                 player.setSneaking(!player.isSneaking());
                 if (player.isSneaking()) {
                     Bukkit.getScheduler().runTaskLater(plugin,
-                            () -> {
-                                Player p = Bukkit.getPlayerExact(name);
-                                if (p != null) p.setSneaking(false);
-                            }, 20L);
+                            () -> { Player p = Bukkit.getPlayerExact(name);
+                                    if (p != null) p.setSneaking(false); }, 20L);
                 }
             }
         }
@@ -288,11 +295,13 @@ public class BotClient {
 
     // ═══════════════════════════════════════════════════════════════════════
     // Topic pool — random, natural Chinese chat lines
+    // Each inner list is one topic category; {other} → random player name
     // ═══════════════════════════════════════════════════════════════════════
 
     private static List<List<String>> buildTopicPool() {
         List<List<String>> pool = new ArrayList<>();
 
+        // 0 挖矿 & 资源
         pool.add(Arrays.asList(
             "刚挖到钻石！今天手气不错",
             "深层矿好难找，挖了半天就几块铁矿",
@@ -305,6 +314,7 @@ public class BotClient {
             "发现一个废弃矿井，箱子里有不少好东西"
         ));
 
+        // 1 建筑 & 装修
         pool.add(Arrays.asList(
             "我在建一个中式大宅，感觉要建很久",
             "有人给我推荐个好看的屋顶设计吗",
@@ -317,6 +327,7 @@ public class BotClient {
             "玻璃天窗真的很好看，推荐大家试试"
         ));
 
+        // 2 生存技巧
         pool.add(Arrays.asList(
             "新手提示：床一定要放在家里，不然重生点丢了很惨",
             "记得给你的装备附魔耐久，省得经常修",
@@ -329,6 +340,7 @@ public class BotClient {
             "村庄里的铁傀儡可以帮你打怪，别杀他"
         ));
 
+        // 3 战斗 & PVE
         pool.add(Arrays.asList(
             "末影龙终于被我打败了！！",
             "凋零boss好难打，差点被我打死",
@@ -341,6 +353,7 @@ public class BotClient {
             "骷髅弓箭手比僵尸麻烦多了，要先躲柱子"
         ));
 
+        // 4 红石 & 自动化
         pool.add(Arrays.asList(
             "我做了一个全自动甘蔗农场，一晚上收了好多",
             "红石真的学不会，看教程也搞不懂",
@@ -353,6 +366,7 @@ public class BotClient {
             "凋零骷髅头自动收集机太难了，放弃了"
         ));
 
+        // 5 探险 & 地形
         pool.add(Arrays.asList(
             "发现一个蘑菇岛！这里没有怪物真舒服",
             "我跑了好远才找到樱花树林，值了",
@@ -365,6 +379,7 @@ public class BotClient {
             "末地探索回来了，带了好多紫珀矿"
         ));
 
+        // 6 游戏心得 & 感想
         pool.add(Arrays.asList(
             "我觉得MC最好玩的就是完全自由，想干啥干啥",
             "每次新开档都有不一样的感觉",
@@ -377,6 +392,7 @@ public class BotClient {
             "第一次见到极光的时候真的被震惊到了"
         ));
 
+        // 7 新闻 & 版本更新
         pool.add(Arrays.asList(
             "新版本加了好多新东西，还没全探索完",
             "听说下个版本要加新的群系，期待",
@@ -389,6 +405,7 @@ public class BotClient {
             "新加的骆驼坐两人真的很方便"
         ));
 
+        // 8 生活闲聊
         pool.add(Arrays.asList(
             "今天现实好热，来游戏里吹空调",
             "作业写完了终于可以玩了！",
@@ -401,6 +418,7 @@ public class BotClient {
             "最近工作好忙，终于有时间上来玩了"
         ));
 
+        // 9 食物 & 农业
         pool.add(Arrays.asList(
             "我的小麦田今天大丰收",
             "有人知道怎么高效养牛吗",
@@ -413,6 +431,7 @@ public class BotClient {
             "我种了一大片竹子，大熊猫要来我家了"
         ));
 
+        // 10 装备 & 附魔
         pool.add(Arrays.asList(
             "终于凑齐了全套钻石装备！",
             "保护4的胸甲真的抗打",
@@ -425,6 +444,7 @@ public class BotClient {
             "头盔加水下呼吸，打海底神殿舒服多了"
         ));
 
+        // 11 问路 & 求助
         pool.add(Arrays.asList(
             "有人知道村庄在哪个方向吗",
             "{other} 你能借我点石头吗？我没材料了",
@@ -491,4 +511,3 @@ public class BotClient {
     public String  getBotName()  { return name;      }
     public boolean isConnected() { return connected; }
 }
-
