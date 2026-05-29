@@ -15,6 +15,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * One fake-player bot wrapping connection frames and scheduler pipelines.
+ * All intermediate logs are muted except for p.chat broadcasting.
  */
 public class BotClient {
 
@@ -68,15 +69,11 @@ public class BotClient {
         Integer cachedProto = PROTO_CACHE.get(cacheKey);
         if (cachedProto != null) {
             proto.setProtocolVersion(cachedProto);
-            plugin.getLogger().fine("[" + name + "] Using cached protocol: " + cachedProto);
         } else {
             int detectedProto = MinecraftProtocol.queryProtocolVersion(host, port, plugin.getLogger());
             if (detectedProto > 0) {
                 proto.setProtocolVersion(detectedProto);
                 PROTO_CACHE.put(cacheKey, detectedProto);
-                plugin.getLogger().fine("[" + name + "] Protocol " + detectedProto + " cached");
-            } else {
-                plugin.getLogger().fine("[" + name + "] Could not detect protocol, using fallback");
             }
         }
 
@@ -84,11 +81,10 @@ public class BotClient {
 
         if (!proto.completeLogin(name)) {
             socket.close();
-            throw new IOException("Login rejected for: " + name);
+            throw new IOException("Login rejected");
         }
 
         connected = true;
-        // Keep logs clean, wait for verification before showing true join
         startReaderThread();
     }
 
@@ -102,13 +98,8 @@ public class BotClient {
                 if (!connected) return;
                 String msg = e.getMessage() != null ? e.getMessage() : "";
 
-                if (msg.startsWith("Kicked:")) {
-                    // Handled natively by Paper
-                } else if (isProbeDecodeError(msg)) {
-                    int nextId = proto.nextProbeCandidate();
-                    plugin.getLogger().info("[" + name + "] Probe 0x"
-                            + Integer.toHexString(proto.getProbeCandidate() - 1)
-                            + " rejected → advancing token to 0x" + Integer.toHexString(nextId));
+                if (isProbeDecodeError(msg)) {
+                    proto.nextProbeCandidate();
                     probeFailedReconnect = true;
                 }
             } finally {
@@ -130,7 +121,7 @@ public class BotClient {
      */
     public void onProtocolLoginVerified() {
         if (loginNotified.compareAndSet(false, true)) {
-            plugin.getLogger().info(name + " joined the game (Verified & Stable)");
+            // Logs muted here completely per your instruction
 
             // Fire behavior threads
             Bukkit.getScheduler().runTaskLaterAsynchronously(plugin, () -> {
@@ -157,10 +148,8 @@ public class BotClient {
             manager.onBotProbeReconnect(name);
         } else {
             if (!loginNotified.get()) {
-                // Disconnected before being verified -> bypass queue blocks
                 manager.onBotLoginFailed(name);
             } else {
-                plugin.getLogger().info(name + " left the game");
                 manager.onBotDied(name);
             }
         }
@@ -216,6 +205,7 @@ public class BotClient {
         final String finalMsg = msg;
         Bukkit.getScheduler().runTask(plugin, () -> {
             Player p = Bukkit.getPlayerExact(name);
+            // This natively invokes standard public chat via Paper API
             if (p != null && p.isOnline()) p.chat(finalMsg);
         });
     }
@@ -285,7 +275,7 @@ public class BotClient {
         pool.add(Arrays.asList("今天现实好热，来游戏里吹空调", "作业写完了终于可以玩了！", "下班后直接上线"));
         pool.add(Arrays.asList("我的小麦田今天大丰收", "甜浆果真的好烦，走路一直掉血", "烤猪排回血量很高"));
         pool.add(Arrays.asList("终于凑齐了全套钻石装备！", "精准采集保留原始方块", "经验修补和耐久3叠加"));
-        pool.add(Arrays.asList("有人知道村庄在哪个方向吗", "{other} 能借我点石头吗？", "迷路了谁来救救我"));
+        pool.add(Arrays.asList("有人知道村庄在哪个方向吗", "{other} 能借我点石头吗？", "迷路了谁来救稳我"));
         return Collections.unmodifiableList(pool);
     }
 
