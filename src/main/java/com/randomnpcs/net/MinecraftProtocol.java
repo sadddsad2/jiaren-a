@@ -434,8 +434,17 @@ public class MinecraftProtocol {
                 cacheAndResolve();
                 sendKeepAlive(pendingKeepAliveId);
             } else {
-                // Begin probing with the persisted candidate
-                probeKeepAlive();
+                // Immediately respond with offset-based guess to prevent timeout.
+                // The guess is almost always correct; we confirm on the next KA.
+                int offset = (protocolVersion >= 764) ? 0x0E : 0x0C;
+                int guessedSB = Math.max(1, keepAliveClientboundId - offset);
+                ByteArrayOutputStream kaR = new ByteArrayOutputStream();
+                writeLong(kaR, pendingKeepAliveId);
+                sendRaw(guessedSB, kaR.toByteArray());
+                log.fine("[" + botName + "] KA sent with guessed SB=0x"
+                        + Integer.toHexString(guessedSB) + ", awaiting confirmation");
+                probeCandidate = guessedSB;
+                PROBE_CANDIDATE_CACHE.put(cacheKey, probeCandidate);
             }
             return;
         }
