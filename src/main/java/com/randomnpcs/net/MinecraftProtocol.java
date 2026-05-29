@@ -10,6 +10,7 @@ import java.util.logging.Logger;
 
 /**
  * Minimal Minecraft protocol client — fully adaptive Play-state packet detection.
+ * Silent Edition: logs downgraded to FINE level to prevent terminal clutter.
  */
 public class MinecraftProtocol {
 
@@ -116,7 +117,6 @@ public class MinecraftProtocol {
 
     public void setProtocolVersion(int v) {
         this.protocolVersion = v;
-        log.fine("[" + botName + "] Protocol version: " + v);
         seedKnownIds();
     }
 
@@ -170,7 +170,6 @@ public class MinecraftProtocol {
                     return completeConfiguration();
                 }
                 case C_DISCONNECT_LOGIN -> {
-                    log.warning("[" + name + "] Login kick: " + readString(pkt.stream()));
                     return false;
                 }
                 case C_ENCRYPTION_REQUEST, C_LOGIN_PLUGIN_REQUEST -> { return false; }
@@ -253,7 +252,6 @@ public class MinecraftProtocol {
                 sendRaw(S_CONFIRM_TELEPORT, r.toByteArray());
                 bot.updatePosition(sp.x, sp.y, sp.z, sp.yaw, sp.pitch);
                 
-                // If IDs are loaded directly from a seeded version, allow fast tracking
                 if (idsResolved) triggerLoginVerifiedOnce(bot);
                 return;
             }
@@ -346,7 +344,6 @@ public class MinecraftProtocol {
                 confirmProbe(id, bot);
             } else {
                 sendKeepAlive(id);
-                // Also ensures stable verification for seed-bypassed logins on first world packet ticks
                 triggerLoginVerifiedOnce(bot);
             }
             return;
