@@ -1,24 +1,23 @@
-# RandomBots Configuration
-# Bot count range (random between min and max)
-bot-count-min: 3
-bot-count-max: 10
+# RandomBots 配置文件
+# ── 单假人驻留模式 ──────────────────────────────────────────────────────
+# 同一时刻只有一个假人在线；死亡/断线后等待 respawn-delay 秒自动重连。
 
-# Server connection (falls back to SERVER_PORT env variable)
+# 目标服务器（可被 SERVER_PORT 环境变量覆盖）
 server-host: "localhost"
-server-port: 25565  # overridden by SERVER_PORT env var if set
+server-port: 25565
 
-# Chat settings
-chat-interval-min: 15   # seconds between bot messages (min)
-chat-interval-max: 45   # seconds between bot messages (max)
-
-# Action settings
-action-interval-min: 5   # seconds between actions (min)
-action-interval-max: 15  # seconds between actions (max)
-
-# Respawn delay (seconds after bot death)
+# 死亡或断线后多少秒重连
 respawn-delay: 5
 
-# Bot name prefixes/suffixes for generation
+# 聊天间隔（秒）
+chat-interval-min: 15
+chat-interval-max: 45
+
+# 动作间隔（秒，随机移动/摆手/蹲起）
+action-interval-min: 5
+action-interval-max: 15
+
+# 假人名字前缀 / 后缀（随机组合，最长 16 字符）
 name-prefixes:
   - "Dark"
   - "Shadow"
@@ -53,7 +52,7 @@ name-suffixes:
   - "Shield"
   - "Arrow"
 
-# Chat messages bots will say
+# 聊天语句（为空则使用内置话题池）
 chat-messages:
   - "大家好啊！"
   - "服务器真好玩！"
