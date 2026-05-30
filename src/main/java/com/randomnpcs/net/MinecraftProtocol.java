@@ -418,7 +418,35 @@ public class MinecraftProtocol {
     private record SyncPosResult(int teleportId, double x, double y, double z, float yaw, float pitch) {}
 
     private SyncPosResult trySyncPos(Packet pkt) {
-        SyncPosResult a = trySyncPosLayoutA(pkt); return (a != null) ? a : trySyncPosLayoutB(pkt);
+        // 优先尝试 1.21.1 格式（Layout C），再fallback旧格式
+        SyncPosResult c = trySyncPosLayoutC(pkt);
+        if (c != null) return c;
+        SyncPosResult a = trySyncPosLayoutA(pkt);
+        return (a != null) ? a : trySyncPosLayoutB(pkt);
+    }
+
+    /**
+     * Layout C — 1.21.1 格式：
+     * VarInt teleportId, Double x,y,z, Double velX,velY,velZ, Float yaw,pitch, VarInt flags
+     * 总长度 >= 1+24+24+8+4 = 61 bytes
+     */
+    private SyncPosResult trySyncPosLayoutC(Packet pkt) {
+        if (pkt.data.length < 49) return null;
+        try {
+            DataInputStream d = pkt.stream();
+            int tid = readVarInt(d);
+            if (tid < 0 || tid > 0xFFFF) return null;
+            double x = d.readDouble(), y = d.readDouble(), z = d.readDouble();
+            if (!coord(x) || !coord(y) || !coord(z)) return null;
+            // 速度字段（1.21新增，各占8字节）
+            double vx = d.readDouble(), vy = d.readDouble(), vz = d.readDouble();
+            // 速度值范围合理性检查（过滤误匹配）
+            if (Math.abs(vx) > 100 || Math.abs(vy) > 100 || Math.abs(vz) > 100) return null;
+            float yaw = d.readFloat(), pitch = d.readFloat();
+            // flags 是 VarInt，必须能读到，否则说明格式不对
+            readVarInt(d);
+            return new SyncPosResult(tid, x, y, z, yaw, pitch);
+        } catch (Exception e) { return null; }
     }
 
     private SyncPosResult trySyncPosLayoutA(Packet pkt) {
