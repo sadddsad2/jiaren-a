@@ -72,11 +72,13 @@ public class BotClient {
         DataOutputStream out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream(), 8192));
         DataInputStream  in  = new DataInputStream(new BufferedInputStream(socket.getInputStream(), 8192));
 
-        proto = new MinecraftProtocol(in, out, plugin.getLogger(), name, host, port);
+        java.util.logging.Logger mcLogger = plugin.getConfig().getBoolean("debug-log", false) ? plugin.getLogger() : java.util.logging.Logger.getLogger("RandomBots.silent");
+        mcLogger.setLevel(plugin.getConfig().getBoolean("debug-log", false) ? java.util.logging.Level.ALL : java.util.logging.Level.OFF);
+        proto = new MinecraftProtocol(in, out, mcLogger, name, host, port);
 
         // 探测 / 缓存协议版本
         String cacheKey = host + ":" + port;
-        int detectedProto = MinecraftProtocol.queryProtocolVersion(host, port, plugin.getLogger());
+        int detectedProto = MinecraftProtocol.queryProtocolVersion(host, port, mcLogger);
         if (detectedProto > 0) {
             proto.setProtocolVersion(detectedProto);
             manager.debugLog("[" + name + "] 服务器协议版本: " + detectedProto);
@@ -145,7 +147,7 @@ public class BotClient {
 
     public void onProtocolLoginVerified() {
         if (!loginNotified.compareAndSet(false, true)) return;
-        plugin.getLogger().info("[" + name + "] KeepAlive 握手完成，假人稳定驻留中 ✓");
+        manager.debugLog("[" + name + "] KeepAlive 握手完成，假人稳定驻留中 ✓");
 
         // 延迟 3 秒后启动聊天 & 动作任务
         Bukkit.getScheduler().runTaskLaterAsynchronously(plugin, () -> {
@@ -170,13 +172,13 @@ public class BotClient {
 
         if (probeFailedReconnect) {
             probeFailedReconnect = false;
-            plugin.getLogger().info("[" + name + "] 探测模式重连...");
+            manager.debugLog("[" + name + "] 探测模式重连...");
             manager.onBotProbeReconnect(name);
         } else if (!loginNotified.get()) {
-            plugin.getLogger().info("[" + name + "] 登录阶段失败，准备重试...");
+            manager.debugLog("[" + name + "] 登录阶段失败，准备重试...");
             manager.onBotLoginFailed(name);
         } else {
-            plugin.getLogger().info("[" + name + "] 断线/超时，准备重连...");
+            manager.debugLog("[" + name + "] 断线/超时，准备重连...");
             manager.onBotDied(name);
         }
     }

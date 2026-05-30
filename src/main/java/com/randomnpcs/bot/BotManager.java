@@ -134,15 +134,16 @@ public class BotManager {
         return plugin.getConfig().getInt("bot-count", 1);
     }
 
-    /** 普通日志（始终显示） */
+    /** 所有日志统一受 debug-log 控制 */
     private void log(String msg) {
-        plugin.getLogger().info(msg);
+        if (plugin.getConfig().getBoolean("debug-log", false)) {
+            plugin.getLogger().info(msg);
+        }
     }
 
-    /** 调试日志（debug-log: true 时才显示） */
     public void debugLog(String msg) {
         if (plugin.getConfig().getBoolean("debug-log", false)) {
-            plugin.getLogger().info("[DEBUG] " + msg);
+            plugin.getLogger().info(msg);
         }
     }
 
