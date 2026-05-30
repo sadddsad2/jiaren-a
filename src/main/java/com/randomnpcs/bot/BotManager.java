@@ -5,29 +5,26 @@ import org.bukkit.Bukkit;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * 严格串行登录管理器：
- * - 同一时刻只允许一个假人处于活跃或登录中状态
- * - 上一个假人死亡/断线后，等待 respawn-delay 秒再连下一个
- * - 支持无限循环驻留模式（running 为 true 时永不停止）
+ * 多假人并发管理器：
+ * - 同时维持 bot-count 个假人在线
+ * - 每个假人独立断线/死亡后自动重连
+ * - debug-log: false 时只输出关键日志
  */
 public class BotManager {
 
     private final RandomBotsPlugin plugin;
 
-    /** 当前唯一活跃 bot（null = 无） */
-    private volatile BotClient activeBot = null;
+    /** 当前所有活跃 bot，key = botName */
+    private final Map<String, BotClient> activeBots = new ConcurrentHashMap<>();
 
-    /** 是否正在登录中（防止并发触发两次 connect） */
-    private final AtomicBoolean loginInProgress = new AtomicBoolean(false);
+    /** 正在登录中的 bot 数量（防止并发超额创建） */
+    private final AtomicInteger loginInProgress = new AtomicInteger(0);
 
     private volatile boolean running = false;
-
-    /** 名字轮换池，避免重复 */
-    private final Set<String> usedNames = new HashSet<>();
+    private final Set<String> usedNames = Collections.synchronizedSet(new HashSet<>());
     private final Random random = new Random();
 
     public BotManager(RandomBotsPlugin plugin) {
@@ -39,31 +36,36 @@ public class BotManager {
     public synchronized void startBots() {
         if (running) return;
         running = true;
-        scheduleNextBot(0L);
+        int target = getTargetCount();
+        log("启动多假人模式，目标数量: " + target);
+        for (int i = 0; i < target; i++) {
+            scheduleNextBot(i * 20L); // 每个间隔1秒错开登录，避免同时连接
+        }
     }
 
     public synchronized void stopAllBots() {
         running = false;
-        loginInProgress.set(false);
-        if (activeBot != null) {
-            activeBot.disconnect("Plugin shutting down");
-            activeBot = null;
+        loginInProgress.set(0);
+        for (BotClient bot : activeBots.values()) {
+            bot.disconnect("Plugin shutting down");
         }
+        activeBots.clear();
         usedNames.clear();
     }
 
-    // ── 核心调度：在指定延迟后尝试连接下一个 bot ─────────────────────────
+    // ── 核心调度 ─────────────────────────────────────────────────────────
 
     private void scheduleNextBot(long delayTicks) {
         if (!running) return;
-        // 防止双重触发
-        if (!loginInProgress.compareAndSet(false, true)) return;
-
         Bukkit.getScheduler().runTaskLaterAsynchronously(plugin, () -> {
-            if (!running) {
-                loginInProgress.set(false);
+            if (!running) return;
+            // 检查当前在线+登录中是否已达目标
+            int current = activeBots.size() + loginInProgress.get();
+            if (current >= getTargetCount()) {
+                debugLog("已达目标数量 " + getTargetCount() + "，跳过本次调度");
                 return;
             }
+            loginInProgress.incrementAndGet();
             connectNewBot();
         }, Math.max(1L, delayTicks));
     }
@@ -74,16 +76,13 @@ public class BotManager {
         int port = plugin.getServerPort();
 
         BotClient bot = new BotClient(plugin, this, name, host, port);
-        activeBot = bot;
 
         try {
             bot.connect();
         } catch (Exception e) {
-            // 连接建立失败（网络层）→ 忽略错误，稍后重试
-            plugin.getLogger().fine("[BotManager] connect() failed for " + name + ": " + e.getMessage());
-            activeBot = null;
+            debugLog("[BotManager] connect() 失败 " + name + ": " + e.getMessage());
             usedNames.remove(name);
-            loginInProgress.set(false);
+            loginInProgress.decrementAndGet();
             long retryDelay = plugin.getConfig().getInt("respawn-delay", 5) * 20L;
             scheduleNextBot(retryDelay);
         }
@@ -91,50 +90,61 @@ public class BotManager {
 
     // ── BotClient 回调 ───────────────────────────────────────────────────
 
-    /** 登录成功进入 Play 状态 — 保持 loginInProgress=true 以防止第二个 bot 被创建 */
-    public void onBotLoginSuccess(String botName) {
-        // bot 已在线，不再 loginInProgress，但 activeBot 保持
-        // 重置标志：当前 bot 活跃期间不允许新建
-        loginInProgress.set(false);
-        plugin.getLogger().fine("[BotManager] " + botName + " 成功登录并驻留中");
+    public void onBotLoginSuccess(String botName, BotClient bot) {
+        activeBots.put(botName, bot);
+        loginInProgress.decrementAndGet();
+        log("[" + botName + "] 登录成功，当前在线: " + activeBots.size() + "/" + getTargetCount());
     }
 
-    /** 登录阶段失败（Login Rejected / 超时等） */
     public void onBotLoginFailed(String botName) {
-        plugin.getLogger().fine("[BotManager] " + botName + " 登录失败，准备重试");
-        activeBot = null;
+        debugLog("[" + botName + "] 登录失败，准备重试");
+        activeBots.remove(botName);
         usedNames.remove(botName);
-        loginInProgress.set(false);
+        loginInProgress.decrementAndGet();
         if (!running) return;
         long retryDelay = plugin.getConfig().getInt("respawn-delay", 5) * 20L;
         scheduleNextBot(retryDelay);
     }
 
-    /** bot 在 Play 状态断线/死亡 — 等待后重连 */
     public void onBotDied(String botName) {
-        plugin.getLogger().fine("[BotManager] " + botName + " 断线/死亡，等待重连");
-        activeBot = null;
+        activeBots.remove(botName);
         usedNames.remove(botName);
-        loginInProgress.set(false);
+        loginInProgress.decrementAndGet();
+        log("[" + botName + "] 断线/死亡，当前在线: " + activeBots.size() + "/" + getTargetCount() + "，等待重连");
         if (!running) return;
         long respawnDelay = plugin.getConfig().getInt("respawn-delay", 5) * 20L;
         scheduleNextBot(respawnDelay);
     }
 
-    /** 包探测失败，快速重连（复用同名，不换名字，因为还未真正入服） */
     public void onBotProbeReconnect(String botName) {
-        activeBot = null;
-        loginInProgress.set(false);
-        if (!running) return;
-        // 短暂延迟后重试同名（换新名也行，这里保持复用）
+        activeBots.remove(botName);
         usedNames.remove(botName);
+        loginInProgress.decrementAndGet();
+        if (!running) return;
         Bukkit.getScheduler().runTaskLaterAsynchronously(plugin, () -> {
             if (!running) return;
+            loginInProgress.incrementAndGet();
             connectNewBot();
         }, 15L);
     }
 
     // ── 工具 ─────────────────────────────────────────────────────────────
+
+    private int getTargetCount() {
+        return plugin.getConfig().getInt("bot-count", 1);
+    }
+
+    /** 普通日志（始终显示） */
+    private void log(String msg) {
+        plugin.getLogger().info(msg);
+    }
+
+    /** 调试日志（debug-log: true 时才显示） */
+    public void debugLog(String msg) {
+        if (plugin.getConfig().getBoolean("debug-log", false)) {
+            plugin.getLogger().info("[DEBUG] " + msg);
+        }
+    }
 
     private String generateUniqueName() {
         List<String> prefixes = plugin.getConfig().getStringList("name-prefixes");
@@ -157,25 +167,14 @@ public class BotManager {
     }
 
     public void removeBot(String name) {
-        if (activeBot != null && activeBot.getBotName().equals(name)) {
-            activeBot = null;
-        }
+        activeBots.remove(name);
         usedNames.remove(name);
     }
 
     // ── 状态查询 ─────────────────────────────────────────────────────────
 
-    public boolean isRunning() { return running; }
-
-    /** 目标数固定为 1（单假人驻留模式） */
-    public int getBotCount() { return 1; }
-
-    public int getActiveBotCount() { return activeBot != null ? 1 : 0; }
-
-    public Map<String, BotClient> getActiveBots() {
-        if (activeBot == null) return Collections.emptyMap();
-        Map<String, BotClient> m = new HashMap<>();
-        m.put(activeBot.getBotName(), activeBot);
-        return Collections.unmodifiableMap(m);
-    }
+    public boolean isRunning()                    { return running; }
+    public int getBotCount()                      { return getTargetCount(); }
+    public int getActiveBotCount()                { return activeBots.size(); }
+    public Map<String, BotClient> getActiveBots() { return Collections.unmodifiableMap(activeBots); }
 }

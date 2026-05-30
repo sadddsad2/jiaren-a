@@ -79,7 +79,7 @@ public class BotClient {
         int detectedProto = MinecraftProtocol.queryProtocolVersion(host, port, plugin.getLogger());
         if (detectedProto > 0) {
             proto.setProtocolVersion(detectedProto);
-            plugin.getLogger().info("[" + name + "] 服务器协议版本: " + detectedProto);
+            manager.debugLog("[" + name + "] 服务器协议版本: " + detectedProto);
         }
 
         proto.initiateLogin(host, port, name, uuid);
@@ -90,7 +90,7 @@ public class BotClient {
         }
 
         connected = true;
-        plugin.getLogger().info("[" + name + "] 已进入 Play 状态，启动读包线程");
+        manager.debugLog("[" + name + "] 已进入 Play 状态，启动读包线程");
         startReaderThread();
     }
 
@@ -106,21 +106,21 @@ public class BotClient {
                     String msg = e.getMessage() != null ? e.getMessage() : "";
 
                     if (isProbeDecodeError(msg)) {
-                        plugin.getLogger().info("[" + name + "] KeepAlive ID 不匹配，换下一个候选值重连...");
+                        manager.debugLog("[" + name + "] KeepAlive ID 不匹配，换下一个候选值重连...");
                         proto.nextProbeCandidate();
                         probeFailedReconnect = true;
                         break;
                     }
 
                     if (isIgnorableError(msg)) {
-                        plugin.getLogger().fine("[" + name + "] 忽略噪音包: " + msg);
+                        manager.debugLog("[" + name + "] 忽略噪音包: " + msg);
                         continue;
                     }
 
-                    plugin.getLogger().info("[" + name + "] 读包线程退出: " + msg);
+                    manager.debugLog("[" + name + "] 读包线程退出: " + msg);
                     break;
                 } catch (Exception e) {
-                    plugin.getLogger().fine("[" + name + "] 意外异常: " + e);
+                    manager.debugLog("[" + name + "] 意外异常: " + e.toString());
                 }
             }
             handleDisconnect();
@@ -156,7 +156,7 @@ public class BotClient {
             }
         }, 60L);
 
-        manager.onBotLoginSuccess(name);
+        manager.onBotLoginSuccess(name, this);
     }
 
     // ── 断线处理 ─────────────────────────────────────────────────────────
