@@ -14,11 +14,14 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * 单假人客户端：
- * - 自动探测协议包 ID
- * - 自动响应 KeepAlive（防超时踢出）
- * - 自动忽略解码错误 / 未知包，不崩溃
- * - 死亡或断线后通知 BotManager 重连
+ * 单假人客户端 v2.4.0
+ * - 协议层自动响应 KeepAlive（防 Timed out）
+ * - 探测成功后持久化到磁盘，重启无需重探
+ * - 断线/死亡后通知 BotManager 重连，实现永久驻留
+ *
+ * 【移除】scheduleKeepActiveTask —— 原实现依赖 Bukkit.getPlayerExact()，
+ *   对协议层假人无效（Bukkit 找不到对象），真正的 keepalive 已在
+ *   MinecraftProtocol.readAndHandle → handleNormal 中通过协议层发送，无需额外心跳。
  */
 public class BotClient {
 
@@ -40,14 +43,11 @@ public class BotClient {
 
     private BukkitTask chatTask;
     private BukkitTask actionTask;
-    /** 防踢心跳任务：定期发送假动作/位置包保持活跃 */
-    private BukkitTask keepActiveTask;
 
     private double x, y, z;
     private float  yaw, pitch;
 
-    private static final ConcurrentHashMap<String, Integer> PROTO_CACHE  = new ConcurrentHashMap<>();
-    private static final List<List<String>>                  TOPIC_POOL   = buildTopicPool();
+    private static final List<List<String>> TOPIC_POOL   = buildTopicPool();
     private final Deque<Integer> recentTopics = new ArrayDeque<>();
     private static final int RECENT_TOPIC_MEMORY = 4;
 
@@ -67,7 +67,7 @@ public class BotClient {
     public void connect() throws IOException {
         socket = new Socket(host, port);
         socket.setTcpNoDelay(true);
-        socket.setSoTimeout(90_000);   // 90 s 无数据才超时（服务器 KeepAlive 周期通常 ≤30s）
+        socket.setSoTimeout(90_000); // 90s 无数据才超时（服务器 keepalive ≤30s）
 
         DataOutputStream out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream(), 8192));
         DataInputStream  in  = new DataInputStream(new BufferedInputStream(socket.getInputStream(), 8192));
@@ -76,15 +76,10 @@ public class BotClient {
 
         // 探测 / 缓存协议版本
         String cacheKey = host + ":" + port;
-        Integer cachedProto = PROTO_CACHE.get(cacheKey);
-        if (cachedProto != null) {
-            proto.setProtocolVersion(cachedProto);
-        } else {
-            int detectedProto = MinecraftProtocol.queryProtocolVersion(host, port, plugin.getLogger());
-            if (detectedProto > 0) {
-                proto.setProtocolVersion(detectedProto);
-                PROTO_CACHE.put(cacheKey, detectedProto);
-            }
+        int detectedProto = MinecraftProtocol.queryProtocolVersion(host, port, plugin.getLogger());
+        if (detectedProto > 0) {
+            proto.setProtocolVersion(detectedProto);
+            plugin.getLogger().info("[" + name + "] 服务器协议版本: " + detectedProto);
         }
 
         proto.initiateLogin(host, port, name, uuid);
@@ -95,10 +90,11 @@ public class BotClient {
         }
 
         connected = true;
+        plugin.getLogger().info("[" + name + "] 已进入 Play 状态，启动读包线程");
         startReaderThread();
     }
 
-    // ── 读包线程（所有异常均被捕获，不崩溃） ────────────────────────────
+    // ── 读包线程 ─────────────────────────────────────────────────────────
 
     private void startReaderThread() {
         Thread t = new Thread(() -> {
@@ -110,24 +106,21 @@ public class BotClient {
                     String msg = e.getMessage() != null ? e.getMessage() : "";
 
                     if (isProbeDecodeError(msg)) {
-                        // 包 ID 探测失败 → 换下一个候选值并重连
+                        plugin.getLogger().info("[" + name + "] KeepAlive ID 不匹配，换下一个候选值重连...");
                         proto.nextProbeCandidate();
                         probeFailedReconnect = true;
                         break;
                     }
 
                     if (isIgnorableError(msg)) {
-                        // 忽略噪音包，继续读
-                        plugin.getLogger().fine("[" + name + "] ignored error: " + msg);
+                        plugin.getLogger().fine("[" + name + "] 忽略噪音包: " + msg);
                         continue;
                     }
 
-                    // 其他 IO 错误（连接断开等）→ 退出循环
-                    plugin.getLogger().fine("[" + name + "] reader exiting: " + msg);
+                    plugin.getLogger().info("[" + name + "] 读包线程退出: " + msg);
                     break;
                 } catch (Exception e) {
-                    // 完全兜底：任何 RuntimeException 都忽略并继续
-                    plugin.getLogger().fine("[" + name + "] unexpected: " + e);
+                    plugin.getLogger().fine("[" + name + "] 意外异常: " + e);
                 }
             }
             handleDisconnect();
@@ -142,7 +135,6 @@ public class BotClient {
                 || msg.contains("was larger than I expected");
     }
 
-    /** 可以安全忽略、继续读包的错误关键字 */
     private static boolean isIgnorableError(String msg) {
         return msg.contains("VarInt too large")
                 || msg.contains("Decompress")
@@ -151,18 +143,16 @@ public class BotClient {
 
     // ── 登录成功回调 ─────────────────────────────────────────────────────
 
-    /**
-     * 由 MinecraftProtocol 在确认 Play 状态同步后调用一次。
-     */
     public void onProtocolLoginVerified() {
         if (!loginNotified.compareAndSet(false, true)) return;
+        plugin.getLogger().info("[" + name + "] KeepAlive 握手完成，假人稳定驻留中 ✓");
 
-        // 延迟 3 秒后启动行为任务
+        // 延迟 3 秒后启动聊天 & 动作任务
         Bukkit.getScheduler().runTaskLaterAsynchronously(plugin, () -> {
             if (connected && alive) {
                 scheduleChatTask();
                 scheduleActionTask();
-                scheduleKeepActiveTask();
+                // 注意：无需 keepActiveTask，协议层 KeepAlive 响应已在读包线程处理
             }
         }, 60L);
 
@@ -180,10 +170,13 @@ public class BotClient {
 
         if (probeFailedReconnect) {
             probeFailedReconnect = false;
+            plugin.getLogger().info("[" + name + "] 探测模式重连...");
             manager.onBotProbeReconnect(name);
         } else if (!loginNotified.get()) {
+            plugin.getLogger().info("[" + name + "] 登录阶段失败，准备重试...");
             manager.onBotLoginFailed(name);
         } else {
+            plugin.getLogger().info("[" + name + "] 断线/超时，准备重连...");
             manager.onBotDied(name);
         }
     }
@@ -197,9 +190,8 @@ public class BotClient {
     }
 
     private void cancelTasks() {
-        if (chatTask       != null) { chatTask.cancel();       chatTask       = null; }
-        if (actionTask     != null) { actionTask.cancel();     actionTask     = null; }
-        if (keepActiveTask != null) { keepActiveTask.cancel(); keepActiveTask = null; }
+        if (chatTask   != null) { chatTask.cancel();   chatTask   = null; }
+        if (actionTask != null) { actionTask.cancel(); actionTask = null; }
     }
 
     private void closeSocket() {
@@ -207,22 +199,7 @@ public class BotClient {
         catch (Exception ignored) {}
     }
 
-    // ── 防踢心跳：每 15–20 秒发一次轻动作（swing hand / sneak toggle） ──
-
-    private void scheduleKeepActiveTask() {
-        keepActiveTask = Bukkit.getScheduler().runTaskTimerAsynchronously(plugin, () -> {
-            if (!connected || !alive) return;
-            // 通过 Bukkit API 摆手，维持服务器"玩家活跃"判定
-            Bukkit.getScheduler().runTask(plugin, () -> {
-                Player p = Bukkit.getPlayerExact(name);
-                if (p != null && p.isOnline()) {
-                    p.swingMainHand();
-                }
-            });
-        }, 300L, 300L); // 每 15 秒（300 ticks）
-    }
-
-    // ── Chat & Action tasks ───────────────────────────────────────────────
+    // ── Chat & Action ─────────────────────────────────────────────────────
 
     private void scheduleChatTask() {
         int min = plugin.getConfig().getInt("chat-interval-min", 15);
@@ -251,7 +228,6 @@ public class BotClient {
         String msg = !configMessages.isEmpty()
                 ? configMessages.get(random.nextInt(configMessages.size()))
                 : generateChatMessage();
-
         Bukkit.getScheduler().runTask(plugin, () -> {
             Player p = Bukkit.getPlayerExact(name);
             if (p != null && p.isOnline()) p.chat(msg);
@@ -310,7 +286,7 @@ public class BotClient {
         }
     }
 
-    // ── 聊天话题池 ───────────────────────────────────────────────────────
+    // ── 话题池 ────────────────────────────────────────────────────────────
 
     private static List<List<String>> buildTopicPool() {
         List<List<String>> pool = new ArrayList<>();
