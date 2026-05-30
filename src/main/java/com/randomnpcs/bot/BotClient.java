@@ -14,8 +14,11 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * One fake-player bot wrapping connection frames and scheduler pipelines.
- * All intermediate logs are muted except for p.chat broadcasting.
+ * 单假人客户端：
+ * - 自动探测协议包 ID
+ * - 自动响应 KeepAlive（防超时踢出）
+ * - 自动忽略解码错误 / 未知包，不崩溃
+ * - 死亡或断线后通知 BotManager 重连
  */
 public class BotClient {
 
@@ -37,34 +40,41 @@ public class BotClient {
 
     private BukkitTask chatTask;
     private BukkitTask actionTask;
+    /** 防踢心跳任务：定期发送假动作/位置包保持活跃 */
+    private BukkitTask keepActiveTask;
 
     private double x, y, z;
     private float  yaw, pitch;
 
-    private static final ConcurrentHashMap<String, Integer> PROTO_CACHE = new ConcurrentHashMap<>();
-    private static final List<List<String>> TOPIC_POOL = buildTopicPool();
+    private static final ConcurrentHashMap<String, Integer> PROTO_CACHE  = new ConcurrentHashMap<>();
+    private static final List<List<String>>                  TOPIC_POOL   = buildTopicPool();
     private final Deque<Integer> recentTopics = new ArrayDeque<>();
     private static final int RECENT_TOPIC_MEMORY = 4;
 
-    public BotClient(RandomBotsPlugin plugin, BotManager manager, String name, String host, int port) {
+    public BotClient(RandomBotsPlugin plugin, BotManager manager,
+                     String name, String host, int port) {
         this.plugin  = plugin;
         this.manager = manager;
         this.name    = name;
         this.host    = host;
         this.port    = port;
-        this.uuid    = UUID.nameUUIDFromBytes(("OfflinePlayer:" + name).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        this.uuid    = UUID.nameUUIDFromBytes(
+                ("OfflinePlayer:" + name).getBytes(java.nio.charset.StandardCharsets.UTF_8));
     }
+
+    // ── 连接 ─────────────────────────────────────────────────────────────
 
     public void connect() throws IOException {
         socket = new Socket(host, port);
         socket.setTcpNoDelay(true);
-        socket.setSoTimeout(60_000);
+        socket.setSoTimeout(90_000);   // 90 s 无数据才超时（服务器 KeepAlive 周期通常 ≤30s）
 
         DataOutputStream out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream(), 8192));
-        DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream(), 8192));
+        DataInputStream  in  = new DataInputStream(new BufferedInputStream(socket.getInputStream(), 8192));
 
         proto = new MinecraftProtocol(in, out, plugin.getLogger(), name, host, port);
 
+        // 探测 / 缓存协议版本
         String cacheKey = host + ":" + port;
         Integer cachedProto = PROTO_CACHE.get(cacheKey);
         if (cachedProto != null) {
@@ -88,23 +98,39 @@ public class BotClient {
         startReaderThread();
     }
 
+    // ── 读包线程（所有异常均被捕获，不崩溃） ────────────────────────────
+
     private void startReaderThread() {
         Thread t = new Thread(() -> {
-            try {
-                while (connected && alive && !socket.isClosed()) {
+            while (connected && alive && !socket.isClosed()) {
+                try {
                     proto.readAndHandle(this);
-                }
-            } catch (IOException e) {
-                if (!connected) return;
-                String msg = e.getMessage() != null ? e.getMessage() : "";
+                } catch (IOException e) {
+                    if (!connected || !alive) break;
+                    String msg = e.getMessage() != null ? e.getMessage() : "";
 
-                if (isProbeDecodeError(msg)) {
-                    proto.nextProbeCandidate();
-                    probeFailedReconnect = true;
+                    if (isProbeDecodeError(msg)) {
+                        // 包 ID 探测失败 → 换下一个候选值并重连
+                        proto.nextProbeCandidate();
+                        probeFailedReconnect = true;
+                        break;
+                    }
+
+                    if (isIgnorableError(msg)) {
+                        // 忽略噪音包，继续读
+                        plugin.getLogger().fine("[" + name + "] ignored error: " + msg);
+                        continue;
+                    }
+
+                    // 其他 IO 错误（连接断开等）→ 退出循环
+                    plugin.getLogger().fine("[" + name + "] reader exiting: " + msg);
+                    break;
+                } catch (Exception e) {
+                    // 完全兜底：任何 RuntimeException 都忽略并继续
+                    plugin.getLogger().fine("[" + name + "] unexpected: " + e);
                 }
-            } finally {
-                handleDisconnect();
             }
+            handleDisconnect();
         }, "RandomBot-" + name);
         t.setDaemon(true);
         t.start();
@@ -116,25 +142,34 @@ public class BotClient {
                 || msg.contains("was larger than I expected");
     }
 
+    /** 可以安全忽略、继续读包的错误关键字 */
+    private static boolean isIgnorableError(String msg) {
+        return msg.contains("VarInt too large")
+                || msg.contains("Decompress")
+                || msg.contains("skipped");
+    }
+
+    // ── 登录成功回调 ─────────────────────────────────────────────────────
+
     /**
-     * Intercept callback executed exclusively when MinecraftProtocol verifies stable synchronization.
+     * 由 MinecraftProtocol 在确认 Play 状态同步后调用一次。
      */
     public void onProtocolLoginVerified() {
-        if (loginNotified.compareAndSet(false, true)) {
-            // Logs muted here completely per your instruction
+        if (!loginNotified.compareAndSet(false, true)) return;
 
-            // Fire behavior threads
-            Bukkit.getScheduler().runTaskLaterAsynchronously(plugin, () -> {
-                if (connected && alive) {
-                    scheduleChatTask();
-                    scheduleActionTask();
-                }
-            }, 60L);
+        // 延迟 3 秒后启动行为任务
+        Bukkit.getScheduler().runTaskLaterAsynchronously(plugin, () -> {
+            if (connected && alive) {
+                scheduleChatTask();
+                scheduleActionTask();
+                scheduleKeepActiveTask();
+            }
+        }, 60L);
 
-            // Unlock and release the queue manager
-            manager.onBotLoginSuccess(name);
-        }
+        manager.onBotLoginSuccess(name);
     }
+
+    // ── 断线处理 ─────────────────────────────────────────────────────────
 
     public void handleDisconnect() {
         if (!alive) return;
@@ -146,12 +181,10 @@ public class BotClient {
         if (probeFailedReconnect) {
             probeFailedReconnect = false;
             manager.onBotProbeReconnect(name);
+        } else if (!loginNotified.get()) {
+            manager.onBotLoginFailed(name);
         } else {
-            if (!loginNotified.get()) {
-                manager.onBotLoginFailed(name);
-            } else {
-                manager.onBotDied(name);
-            }
+            manager.onBotDied(name);
         }
     }
 
@@ -164,8 +197,9 @@ public class BotClient {
     }
 
     private void cancelTasks() {
-        if (chatTask   != null) { chatTask.cancel();   chatTask   = null; }
-        if (actionTask != null) { actionTask.cancel(); actionTask = null; }
+        if (chatTask       != null) { chatTask.cancel();       chatTask       = null; }
+        if (actionTask     != null) { actionTask.cancel();     actionTask     = null; }
+        if (keepActiveTask != null) { keepActiveTask.cancel(); keepActiveTask = null; }
     }
 
     private void closeSocket() {
@@ -173,11 +207,27 @@ public class BotClient {
         catch (Exception ignored) {}
     }
 
+    // ── 防踢心跳：每 15–20 秒发一次轻动作（swing hand / sneak toggle） ──
+
+    private void scheduleKeepActiveTask() {
+        keepActiveTask = Bukkit.getScheduler().runTaskTimerAsynchronously(plugin, () -> {
+            if (!connected || !alive) return;
+            // 通过 Bukkit API 摆手，维持服务器"玩家活跃"判定
+            Bukkit.getScheduler().runTask(plugin, () -> {
+                Player p = Bukkit.getPlayerExact(name);
+                if (p != null && p.isOnline()) {
+                    p.swingMainHand();
+                }
+            });
+        }, 300L, 300L); // 每 15 秒（300 ticks）
+    }
+
     // ── Chat & Action tasks ───────────────────────────────────────────────
+
     private void scheduleChatTask() {
         int min = plugin.getConfig().getInt("chat-interval-min", 15);
         int max = plugin.getConfig().getInt("chat-interval-max", 45);
-        long ticks = (min + random.nextInt(max - min + 1)) * 20L;
+        long ticks = (min + random.nextInt(Math.max(1, max - min + 1))) * 20L;
         chatTask = Bukkit.getScheduler().runTaskLaterAsynchronously(plugin, () -> {
             if (!connected || !alive) return;
             sendChatViaApi();
@@ -188,7 +238,7 @@ public class BotClient {
     private void scheduleActionTask() {
         int min = plugin.getConfig().getInt("action-interval-min", 5);
         int max = plugin.getConfig().getInt("action-interval-max", 15);
-        long ticks = (min + random.nextInt(max - min + 1)) * 20L;
+        long ticks = (min + random.nextInt(Math.max(1, max - min + 1))) * 20L;
         actionTask = Bukkit.getScheduler().runTaskLater(plugin, () -> {
             if (!connected || !alive) return;
             performActionViaApi();
@@ -198,15 +248,13 @@ public class BotClient {
 
     private void sendChatViaApi() {
         List<String> configMessages = plugin.getConfig().getStringList("chat-messages");
-        String msg = !configMessages.isEmpty() ? configMessages.get(random.nextInt(configMessages.size())) : generateChatMessage();
-        Player player = Bukkit.getPlayerExact(name);
-        if (player == null || !player.isOnline()) return;
+        String msg = !configMessages.isEmpty()
+                ? configMessages.get(random.nextInt(configMessages.size()))
+                : generateChatMessage();
 
-        final String finalMsg = msg;
         Bukkit.getScheduler().runTask(plugin, () -> {
             Player p = Bukkit.getPlayerExact(name);
-            // This natively invokes standard public chat via Paper API
-            if (p != null && p.isOnline()) p.chat(finalMsg);
+            if (p != null && p.isOnline()) p.chat(msg);
         });
     }
 
@@ -214,10 +262,8 @@ public class BotClient {
         int topicIdx; int attempts = 0;
         do { topicIdx = random.nextInt(TOPIC_POOL.size()); attempts++; }
         while (recentTopics.contains(topicIdx) && attempts < 20);
-
         recentTopics.addLast(topicIdx);
         if (recentTopics.size() > RECENT_TOPIC_MEMORY) recentTopics.removeFirst();
-
         String line = TOPIC_POOL.get(topicIdx).get(random.nextInt(TOPIC_POOL.get(topicIdx).size()));
         if (line.contains("{other}")) line = line.replace("{other}", pickOtherPlayerName());
         return line;
@@ -240,13 +286,15 @@ public class BotClient {
                 double dx = (random.nextDouble() - 0.5) * 3, dz = (random.nextDouble() - 0.5) * 3;
                 Location target = loc.clone().add(dx, 0, dz);
                 if (target.getWorld() != null && target.getChunk().isLoaded()) {
-                    target.setYaw((float) Math.toDegrees(Math.atan2(-dx, dz))); target.setPitch(0);
+                    target.setYaw((float) Math.toDegrees(Math.atan2(-dx, dz)));
+                    target.setPitch(0);
                     player.teleport(target);
                 }
             }
             case 1 -> {
                 Location loc = player.getLocation();
-                loc.setYaw(random.nextFloat() * 360f - 180f); loc.setPitch(random.nextFloat() * 60f - 30f);
+                loc.setYaw(random.nextFloat() * 360f - 180f);
+                loc.setPitch(random.nextFloat() * 60f - 30f);
                 player.teleport(loc);
             }
             case 2 -> player.swingMainHand();
@@ -262,6 +310,8 @@ public class BotClient {
         }
     }
 
+    // ── 聊天话题池 ───────────────────────────────────────────────────────
+
     private static List<List<String>> buildTopicPool() {
         List<List<String>> pool = new ArrayList<>();
         pool.add(Arrays.asList("刚挖到钻石！今天手气不错", "有人知道钻石层在y多少吗", "发现一个废弃矿井，箱子里有不少好东西"));
@@ -271,13 +321,15 @@ public class BotClient {
         pool.add(Arrays.asList("我做了一个全自动甘蔗农场", "红石真的学不会，看教程也搞不懂", "铁傀儡农场的效率真香"));
         pool.add(Arrays.asList("发现一个蘑菇岛！这里没有怪物真舒服", "我跑了好远才找到樱花树林", "沙漠神殿宝箱有tnt陷阱"));
         pool.add(Arrays.asList("我觉得MC最好玩的就是完全自由", "多人联机比单人有意思多了，热闹", "服务器人多就是好"));
-        pool.add(Arrays.asList("新版本加了好多新东西", "铜灯泡加进进来，建筑党狂喜", "风弹弓真的好玩"));
+        pool.add(Arrays.asList("新版本加了好多新东西", "铜灯泡加进来，建筑党狂喜", "风弹弓真的好玩"));
         pool.add(Arrays.asList("今天现实好热，来游戏里吹空调", "作业写完了终于可以玩了！", "下班后直接上线"));
         pool.add(Arrays.asList("我的小麦田今天大丰收", "甜浆果真的好烦，走路一直掉血", "烤猪排回血量很高"));
         pool.add(Arrays.asList("终于凑齐了全套钻石装备！", "精准采集保留原始方块", "经验修补和耐久3叠加"));
-        pool.add(Arrays.asList("有人知道村庄在哪个方向吗", "{other} 能借我点石头吗？", "迷路了谁来救稳我"));
+        pool.add(Arrays.asList("有人知道村庄在哪个方向吗", "{other} 能借我点石头吗？", "迷路了谁来救救我"));
         return Collections.unmodifiableList(pool);
     }
+
+    // ── 工具方法 ─────────────────────────────────────────────────────────
 
     public void updatePosition(double nx, double ny, double nz, float nyaw, float npitch) {
         this.x = nx; this.y = ny; this.z = nz; this.yaw = nyaw; this.pitch = npitch;
@@ -285,5 +337,5 @@ public class BotClient {
 
     public String  getBotName()  { return name;      }
     public boolean isConnected() { return connected; }
-    public void setProbeFailedReconnect(boolean val) { this.probeFailedReconnect = val; }
+    public void    setProbeFailedReconnect(boolean val) { this.probeFailedReconnect = val; }
 }
